@@ -102,7 +102,7 @@ impl<I: Copy + Hash + Ord + fmt::Debug, T: Hash + Ord> State<I, T> {
     fn canon(&self, txn_id: &I) -> Canon<T> {
         let mut canon = self.canon.clone();
 
-        for (_, delta) in self.deltas.iter().take_while(|(id, _)| *id <= &txn_id) {
+        for (_, delta) in self.deltas.iter().take_while(|(id, _)| *id <= txn_id) {
             merge(&mut canon, delta);
         }
 
@@ -404,7 +404,7 @@ where
             state.remove(txn_id, key);
         }
 
-        return Ok(set);
+        Ok(set)
     }
 
     /// Remove and return all keys in this [`TxnSetLock`] at `txn_id` synchronously, if possible.
@@ -424,7 +424,7 @@ where
             state.remove(txn_id, key);
         }
 
-        return Ok(set);
+        Ok(set)
     }
 
     /// Insert the `other` keys into this [`TxnSetLock`] at `txn_id`.
@@ -474,7 +474,7 @@ where
             merge(&mut set, delta);
         }
 
-        return Ok(Iter::new(permit, set));
+        Ok(Iter::new(permit, set))
     }
 
     /// Construct an iterator over this [`TxnSetLock`] at `txn_id` synchronously, if possible.
@@ -488,7 +488,7 @@ where
             merge(&mut set, delta);
         }
 
-        return Ok(Iter::new(permit, set));
+        Ok(Iter::new(permit, set))
     }
 
     /// Insert a new `key` into this [`TxnSetLock`] at `txn_id`.
@@ -499,7 +499,8 @@ where
         let mut state = self.state_mut();
         state.check_pending(&txn_id)?;
 
-        Ok(state.insert(txn_id, key))
+        state.insert(txn_id, key);
+        Ok(())
     }
 
     /// Insert a new `key` into this [`TxnSetLock`] at `txn_id` synchronously, if possible.
@@ -510,7 +511,8 @@ where
         let mut state = self.state_mut();
         state.check_pending(&txn_id)?;
 
-        Ok(state.insert(txn_id, key))
+        state.insert(txn_id, key);
+        Ok(())
     }
 
     /// Return `true` if this [`TxnSetLock`] is empty at the given `txn_id`.

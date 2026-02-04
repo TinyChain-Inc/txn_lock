@@ -210,7 +210,7 @@ impl<I: Copy + Ord + Hash + fmt::Debug, T: Clone + fmt::Debug> State<I, T> {
             version.clone()
         } else {
             let canon = self.read_canon(&txn_id);
-            let value = T::clone(&*canon);
+            let value = T::clone(canon);
             let version = Arc::new(RwLock::new(value));
             self.pending.insert(txn_id, version.clone());
             version

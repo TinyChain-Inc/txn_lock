@@ -54,6 +54,12 @@ impl<I, M> MessageQueue<I, M> {
     }
 }
 
+impl<I, M> Default for MessageQueue<I, M> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<I: Copy + Eq + Ord + Hash, M> MessageQueue<I, M> {
     /// Push the given `message` onto the queue at `txn_id`.
     pub fn push(&self, txn_id: I, message: M) -> Result<(), Error> {

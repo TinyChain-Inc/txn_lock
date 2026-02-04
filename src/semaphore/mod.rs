@@ -182,7 +182,7 @@ where
         for (version_id, version) in versions.iter_mut() {
             match txn_id.cmp(version_id) {
                 Ordering::Greater => {
-                    if version.is_pending_write_at(&range) {
+                    if version.is_pending_write_at(range.as_ref()) {
                         #[cfg(feature = "logging")]
                         log::trace!("{range:?} is reserved for writing at {version_id:?}");
 
@@ -252,8 +252,7 @@ where
                 .map(|permit| PermitRead {
                     permit,
                     notify: self.notify.clone(),
-                })
-                .map_err(Error::from),
+                }),
         }
     }
 
@@ -273,7 +272,7 @@ where
         for (version_id, version) in versions.iter() {
             match txn_id.cmp(version_id) {
                 Ordering::Greater => {
-                    if version.is_pending_write_at(&range) {
+                    if version.is_pending_write_at(range.as_ref()) {
                         // if there's a write lock in the past, wait it out
                         #[cfg(feature = "logging")]
                         log::trace!("there is a pending write overlapping {:?}", range);
@@ -285,7 +284,7 @@ where
                     // this case is handled below
                 }
                 Ordering::Less => {
-                    if version.has_been_read_at(&range) {
+                    if version.has_been_read_at(range.as_ref()) {
                         // can't allow writes to this range, there's already a future version
                         return Err(Error::Conflict);
                     }
@@ -372,8 +371,7 @@ where
                 .map(|permit| PermitWrite {
                     permit,
                     notify: self.notify.clone(),
-                })
-                .map_err(Error::from),
+                }),
         }
     }
 }

@@ -38,7 +38,7 @@ where
         }
     }
 
-    fn check_pending(&mut self, txn_id: I) -> Result<Entry<I, S>, Error> {
+    fn check_pending(&mut self, txn_id: I) -> Result<Entry<'_, I, S>, Error> {
         if Some(&txn_id) <= self.finalized.as_ref() {
             Err(Error::Outdated)
         } else if self.commits.contains(&txn_id) {
@@ -66,7 +66,7 @@ where
 
     fn rollback(&mut self, txn_id: &I) -> Option<S> {
         assert!(
-            self.finalized.as_ref() < Some(&txn_id),
+            self.finalized.as_ref() < Some(txn_id),
             "queue is already finalized at {txn_id:?}"
         );
 

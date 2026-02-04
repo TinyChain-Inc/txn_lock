@@ -96,20 +96,13 @@ impl<K> Borrow<Arc<K>> for Key<K> {
 #[cfg(feature = "id")]
 impl Borrow<str> for Key<hr_id::Id> {
     fn borrow(&self) -> &str {
-        (&*self.key).borrow()
-    }
-}
-
-#[cfg(feature = "id")]
-impl Borrow<String> for Key<hr_id::Id> {
-    fn borrow(&self) -> &String {
-        (&*self.key).borrow()
+        self.key.as_ref().borrow()
     }
 }
 
 impl Borrow<str> for Key<String> {
     fn borrow(&self) -> &str {
-        (&*self.key).borrow()
+        self.key.as_str()
     }
 }
 

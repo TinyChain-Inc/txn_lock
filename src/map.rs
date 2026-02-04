@@ -404,7 +404,7 @@ where
             }
         }
 
-        self.get_canon(&txn_id, key)
+        self.get_canon(txn_id, key)
             .map(|value| PendingValue::Committed(value))
     }
 
@@ -665,7 +665,7 @@ impl<K, V> EntryOccupied<K, V> {
 
     /// Borrow this entry's key.
     pub fn key(&self) -> &K {
-        &*self.key
+        &self.key
     }
 }
 
@@ -692,7 +692,7 @@ where
 
     /// Borrow this entry's key.
     pub fn key(&self) -> &K {
-        &*self.key
+        &self.key
     }
 }
 
@@ -852,7 +852,8 @@ where
         let mut state = self.state_mut();
         state.check_pending(&txn_id)?;
 
-        Ok(state.extend(txn_id, other))
+        state.extend(txn_id, other);
+        Ok(())
     }
 
     /// Insert the entries from `other` [`TxnMapLock`] at `txn_id` synchronously, if possible.
@@ -869,7 +870,8 @@ where
 
         let _permit = self.semaphore.try_write(txn_id, Range::All)?;
 
-        Ok(state.extend(txn_id, other))
+        state.extend(txn_id, other);
+        Ok(())
     }
 
     /// Read a value from this [`TxnMapLock`] at `txn_id`.

@@ -5,7 +5,6 @@ use std::sync::{Arc, Mutex};
 use std::{fmt, mem};
 
 use collate::{Collate, Overlap, OverlapsRange};
-use ds_ext::List;
 use futures::future::{self, Future, TryFutureExt};
 use futures::try_join;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -126,31 +125,31 @@ impl<C, R> RangeLock<C, R> {
 }
 
 impl<C: Send + Sync, R: Send + Sync> RangeLock<C, R> {
-    fn acquire(&self) -> BoxTryFuture<NodePermit> {
+    fn acquire(&self) -> BoxTryFuture<'_, NodePermit> {
         Box::pin(async move {
             let permit = self.semaphore.clone().acquire_owned().await?;
 
-            #[inline]
-            fn child_lock<C, R>(
-                node: Option<&Box<RangeLock<C, R>>>,
-            ) -> BoxTryFuture<Option<Box<NodePermit>>>
-            where
-                C: Send + Sync,
-                R: Send + Sync,
-            {
-                if let Some(node) = node {
-                    Box::pin(node.acquire().map_ok(Box::new).map_ok(Some))
+        #[inline]
+        fn child_lock<C, R>(
+            node: Option<&RangeLock<C, R>>,
+        ) -> BoxTryFuture<'_, Option<Box<NodePermit>>>
+        where
+            C: Send + Sync,
+            R: Send + Sync,
+        {
+            if let Some(node) = node {
+                Box::pin(node.acquire().map_ok(Box::new).map_ok(Some))
                 } else {
                     Box::pin(future::ready(Ok(None)))
                 }
             }
 
             let (left, left_partial, center, right_partial, right) = try_join!(
-                child_lock(self.left.as_ref()),
-                child_lock(self.left_partial.as_ref()),
-                child_lock(self.center.as_ref()),
-                child_lock(self.right_partial.as_ref()),
-                child_lock(self.right.as_ref()),
+                child_lock(self.left.as_deref()),
+                child_lock(self.left_partial.as_deref()),
+                child_lock(self.center.as_deref()),
+                child_lock(self.right_partial.as_deref()),
+                child_lock(self.right.as_deref()),
             )?;
 
             Ok(NodePermit {
@@ -164,7 +163,7 @@ impl<C: Send + Sync, R: Send + Sync> RangeLock<C, R> {
         let permit = self.semaphore.clone().try_acquire_owned()?;
 
         #[inline]
-        fn child_lock<C, R>(node: Option<&Box<RangeLock<C, R>>>) -> Result<Option<Box<NodePermit>>>
+        fn child_lock<C, R>(node: Option<&RangeLock<C, R>>) -> Result<Option<Box<NodePermit>>>
         where
             C: Send + Sync,
             R: Send + Sync,
@@ -179,29 +178,29 @@ impl<C: Send + Sync, R: Send + Sync> RangeLock<C, R> {
         Ok(NodePermit {
             permit,
             children: [
-                child_lock(self.left.as_ref())?,
-                child_lock(self.left_partial.as_ref())?,
-                child_lock(self.center.as_ref())?,
-                child_lock(self.right_partial.as_ref())?,
-                child_lock(self.right.as_ref())?,
+                child_lock(self.left.as_deref())?,
+                child_lock(self.left_partial.as_deref())?,
+                child_lock(self.center.as_deref())?,
+                child_lock(self.right_partial.as_deref())?,
+                child_lock(self.right.as_deref())?,
             ],
         })
     }
 
-    fn acquire_many(&self, permits: u32) -> BoxTryFuture<NodePermit> {
+    fn acquire_many(&self, permits: u32) -> BoxTryFuture<'_, NodePermit> {
         Box::pin(async move {
             let permit = self.semaphore.clone().acquire_many_owned(permits).await?;
 
-            #[inline]
-            fn child_lock<C, R>(
-                node: Option<&Box<RangeLock<C, R>>>,
-                permits: u32,
-            ) -> BoxTryFuture<Option<Box<NodePermit>>>
-            where
-                C: Send + Sync,
-                R: Send + Sync,
-            {
-                if let Some(node) = node {
+        #[inline]
+        fn child_lock<C, R>(
+            node: Option<&RangeLock<C, R>>,
+            permits: u32,
+        ) -> BoxTryFuture<'_, Option<Box<NodePermit>>>
+        where
+            C: Send + Sync,
+            R: Send + Sync,
+        {
+            if let Some(node) = node {
                     Box::pin(node.acquire_many(permits).map_ok(Box::new).map_ok(Some))
                 } else {
                     Box::pin(future::ready(Ok(None)))
@@ -209,11 +208,11 @@ impl<C: Send + Sync, R: Send + Sync> RangeLock<C, R> {
             }
 
             let (left, left_partial, center, right_partial, right) = try_join!(
-                child_lock(self.left.as_ref(), permits),
-                child_lock(self.left_partial.as_ref(), permits),
-                child_lock(self.center.as_ref(), permits),
-                child_lock(self.right_partial.as_ref(), permits),
-                child_lock(self.right.as_ref(), permits),
+                child_lock(self.left.as_deref(), permits),
+                child_lock(self.left_partial.as_deref(), permits),
+                child_lock(self.center.as_deref(), permits),
+                child_lock(self.right_partial.as_deref(), permits),
+                child_lock(self.right.as_deref(), permits),
             )?;
 
             Ok(NodePermit {
@@ -228,7 +227,7 @@ impl<C: Send + Sync, R: Send + Sync> RangeLock<C, R> {
 
         #[inline]
         fn child_lock<C, R>(
-            node: Option<&Box<RangeLock<C, R>>>,
+            node: Option<&RangeLock<C, R>>,
             permits: u32,
         ) -> Result<Option<Box<NodePermit>>>
         where
@@ -245,11 +244,11 @@ impl<C: Send + Sync, R: Send + Sync> RangeLock<C, R> {
         Ok(NodePermit {
             permit,
             children: [
-                child_lock(self.left.as_ref(), permits)?,
-                child_lock(self.left_partial.as_ref(), permits)?,
-                child_lock(self.center.as_ref(), permits)?,
-                child_lock(self.right_partial.as_ref(), permits)?,
-                child_lock(self.right.as_ref(), permits)?,
+                child_lock(self.left.as_deref(), permits)?,
+                child_lock(self.left_partial.as_deref(), permits)?,
+                child_lock(self.center.as_deref(), permits)?,
+                child_lock(self.right_partial.as_deref(), permits)?,
+                child_lock(self.right.as_deref(), permits)?,
             ],
         })
     }
@@ -306,7 +305,7 @@ where
     }
 
     /// Acquire a read lock on this [`RangeLock`] and its children.
-    pub fn read<'a>(&'a self, target: &'a R, collator: &'a C) -> BoxTryFuture<Permit<R>> {
+    pub fn read<'a>(&'a self, target: &'a R, collator: &'a C) -> BoxTryFuture<'a, Permit<R>> {
         Box::pin(async move {
             let overlap = self.range.overlaps(target, collator);
 
@@ -409,7 +408,7 @@ where
     }
 
     /// Acquire a write lock on this [`RangeLock`] and its children.
-    pub fn write<'a>(&'a self, target: &'a R, collator: &'a C) -> BoxTryFuture<Permit<R>> {
+    pub fn write<'a>(&'a self, target: &'a R, collator: &'a C) -> BoxTryFuture<'a, Permit<R>> {
         Box::pin(async move {
             let overlap = self.range.overlaps(target, collator);
 
@@ -526,7 +525,7 @@ impl<C, R: fmt::Debug> fmt::Debug for RangeLock<C, R> {
 /// Semaphores for ranges within a single transactional version
 pub struct Version<C, R> {
     collator: C,
-    roots: List<RangeLock<C, R>>,
+    roots: Vec<RangeLock<C, R>>,
 }
 
 impl<C, R> Version<C, R> {
@@ -534,7 +533,7 @@ impl<C, R> Version<C, R> {
     pub fn new(collator: C) -> Self {
         Self {
             collator,
-            roots: List::with_capacity(1),
+            roots: Vec::with_capacity(1),
         }
     }
 }
@@ -545,8 +544,8 @@ impl<C: Collate + Send + Sync, R: OverlapsRange<R, C> + fmt::Debug + Send + Sync
         #[cfg(feature = "logging")]
         log::debug!("Version::insert {:?} (write: {})", range, write);
 
-        let insert_at = bisect_left(&self.roots, &range, &self.collator);
-        let take_until = bisect_right(&self.roots, &range, &self.collator);
+        let insert_at = bisect_left(&self.roots, range.as_ref(), &self.collator);
+        let take_until = bisect_right(&self.roots, range.as_ref(), &self.collator);
         assert!(take_until >= insert_at);
 
         #[cfg(feature = "logging")]
@@ -579,7 +578,7 @@ impl<C: Collate + Send + Sync, R: OverlapsRange<R, C> + fmt::Debug + Send + Sync
                     #[cfg(feature = "logging")]
                     log::trace!("{:?} is narrow w/r/t {:?}", root.range, range);
 
-                    let node = self.roots.remove(insert_at).expect("root");
+                    let node = self.roots.remove(insert_at);
                     let mut root = RangeLock::new(range, write);
                     root.insert(&self.collator, node);
                     self.roots.insert(insert_at, root);
@@ -590,7 +589,7 @@ impl<C: Collate + Send + Sync, R: OverlapsRange<R, C> + fmt::Debug + Send + Sync
             let mut root = RangeLock::new(range, write);
 
             for _ in insert_at..take_until {
-                let node = self.roots.remove(insert_at).expect("root");
+                let node = self.roots.remove(insert_at);
                 root.insert(&self.collator, node);
             }
 
@@ -614,10 +613,8 @@ impl<C: Collate + Send + Sync, R: OverlapsRange<R, C> + fmt::Debug + Send + Sync
     /// Return `true` if any part of the given range has been reserved for writing.
     pub fn is_pending_write_at(&self, target: &R) -> bool {
         for root in &self.roots {
-            if root.range.contains_partial(target, &self.collator) {
-                if root.is_pending_write() {
-                    return true;
-                }
+            if root.range.contains_partial(target, &self.collator) && root.is_pending_write() {
+                return true;
             }
         }
 
@@ -626,16 +623,16 @@ impl<C: Collate + Send + Sync, R: OverlapsRange<R, C> + fmt::Debug + Send + Sync
 }
 
 #[inline]
-fn bisect_left<'a, C, R>(roots: &'a List<RangeLock<C, R>>, range: &'a R, collator: &'a C) -> usize
+fn bisect_left<'a, C, R>(roots: &'a [RangeLock<C, R>], range: &'a R, collator: &'a C) -> usize
 where
     C: Collate,
     R: OverlapsRange<R, C> + fmt::Debug + 'a,
 {
-    if roots.is_empty() {
+    if roots.is_empty()
+        || roots.first().expect("root").range.overlaps(range, collator) == Overlap::Greater
+    {
         return 0;
-    } else if roots.front().expect("root").range.overlaps(range, collator) == Overlap::Greater {
-        return 0;
-    } else if roots.back().expect("root").range.overlaps(range, collator) == Overlap::Less {
+    } else if roots.last().expect("root").range.overlaps(range, collator) == Overlap::Less {
         return roots.len();
     }
 
@@ -657,16 +654,16 @@ where
 }
 
 #[inline]
-fn bisect_right<'a, C, R>(roots: &'a List<RangeLock<C, R>>, range: &'a R, collator: &'a C) -> usize
+fn bisect_right<'a, C, R>(roots: &'a [RangeLock<C, R>], range: &'a R, collator: &'a C) -> usize
 where
     C: Collate,
     R: OverlapsRange<R, C> + fmt::Debug + 'a,
 {
-    if roots.is_empty() {
+    if roots.is_empty()
+        || roots.first().expect("root").range.overlaps(range, collator) == Overlap::Greater
+    {
         return 0;
-    } else if roots.front().expect("root").range.overlaps(range, collator) == Overlap::Greater {
-        return 0;
-    } else if roots.back().expect("root").range.overlaps(range, collator) == Overlap::Less {
+    } else if roots.last().expect("root").range.overlaps(range, collator) == Overlap::Less {
         return roots.len();
     }
 
