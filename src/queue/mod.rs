@@ -30,14 +30,6 @@ impl<I, S> State<I, S>
 where
     I: Eq + Hash + Ord,
 {
-    fn check_finalized(&mut self, txn_id: &I) -> Result<Option<&mut S>, Error> {
-        if Some(txn_id) <= self.finalized.as_ref() {
-            Err(Error::Outdated)
-        } else {
-            Ok(self.pending.get_mut(txn_id))
-        }
-    }
-
     fn check_pending(&mut self, txn_id: I) -> Result<Entry<'_, I, S>, Error> {
         if Some(&txn_id) <= self.finalized.as_ref() {
             Err(Error::Outdated)

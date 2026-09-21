@@ -538,6 +538,13 @@ impl<C, R> Version<C, R> {
 }
 
 impl<C: Collate + Send + Sync, R: OverlapsRange<R, C> + fmt::Debug + Send + Sync> Version<C, R> {
+    pub fn try_lock(&self) -> Result<Vec<Permit<R>>> {
+        self.roots
+            .iter()
+            .map(|root| root.try_write(&root.range, &self.collator))
+            .collect()
+    }
+
     /// Create a new `range` semaphore and return its root [`RangeLock`]
     pub fn insert(&mut self, range: Arc<R>, write: bool) -> RangeLock<C, R> {
         #[cfg(feature = "logging")]

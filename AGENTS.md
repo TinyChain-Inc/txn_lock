@@ -6,5 +6,8 @@
 - Every message/task queue requires an explicit positive capacity. Reject at the
   limit before spawning work, and release capacity on commit, rollback, finalize,
   cancellation, or drop. Do not add unbounded channels, vectors, or task sets.
-- A queue bound applies per transaction; the host transaction owner separately
-  bounds admitted live transactions. Do not duplicate host-level admission here.
+- A queue bound applies per transaction; callers separately bound admitted live
+  transactions. Do not duplicate caller-level admission here.
+- Canonical state may initialize an unpublished lock. Once published, every
+  observation requires the caller's transaction ID and the corresponding
+  transactional read API.

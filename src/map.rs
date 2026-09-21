@@ -1570,3 +1570,65 @@ fn merge_owned<K: Eq + Hash, V>(version: &mut Canon<K, V>, deltas: Delta<K, V>) 
         };
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+    use std::time::Duration;
+
+    use super::TxnMapLock;
+    use crate::Error;
+
+    #[tokio::test]
+    async fn transactional_iteration_observes_ordered_versions() {
+        let map = TxnMapLock::<u64, String, u64>::from_committed([("base".into(), 0)]);
+        map.insert(2, "pending".to_string(), 2).await.unwrap();
+        let before = map
+            .iter(1)
+            .await
+            .unwrap()
+            .map(|(key, _)| (*key).clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(before, BTreeSet::from(["base".to_string()]));
+
+        map.rollback(&2);
+        map.insert(3, "committed".to_string(), 3).await.unwrap();
+        map.commit(3);
+        let before_finalize = map
+            .iter(4)
+            .await
+            .unwrap()
+            .map(|(key, _)| (*key).clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            before_finalize,
+            BTreeSet::from(["base".to_string(), "committed".to_string()])
+        );
+
+        map.finalize(3);
+        let after_finalize = map
+            .iter(4)
+            .await
+            .unwrap()
+            .map(|(key, _)| (*key).clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(after_finalize, before_finalize);
+    }
+
+    #[tokio::test]
+    async fn transactional_iteration_holds_its_read_range() {
+        let map = TxnMapLock::<u64, String, u64>::from_committed([("base".into(), 0)]);
+        {
+            let mut snapshot = map.iter(2).await.unwrap();
+            assert!(snapshot.next().is_some());
+            let conflict = tokio::time::timeout(
+                Duration::from_millis(100),
+                map.insert(1, "too-late".to_string(), 1),
+            )
+            .await
+            .expect("an older write must not wait behind a newer read")
+            .expect_err("an older write must conflict with the held snapshot");
+            assert_eq!(conflict, Error::Conflict);
+        }
+    }
+}

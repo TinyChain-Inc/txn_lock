@@ -35,7 +35,19 @@ pub enum Error {
     /// A bounded transactional queue has reached its configured capacity
     Saturated,
 
-    /// An error occurred in a background task
+    /// Another task or lifecycle operation holds exclusive admission.
+    Busy,
+
+    /// A task failed or was cancelled before completion.
+    Failed,
+
+    /// The transaction was rolled back.
+    RolledBack,
+
+    /// An armed operation did not complete; this owner cannot safely resume.
+    Interrupted,
+
+    /// An error occurred in a delegated operation.
     Background(String),
 }
 
@@ -49,6 +61,10 @@ impl fmt::Display for Error {
             Self::Outdated => f.write_str("the value has already been finalized"),
             Self::WouldBlock => f.write_str("synchronous lock acquisition failed"),
             Self::Saturated => f.write_str("transactional queue capacity exhausted"),
+            Self::Busy => f.write_str("operation in progress"),
+            Self::Failed => f.write_str("transaction contains a failed or cancelled task"),
+            Self::RolledBack => f.write_str("transaction was rolled back"),
+            Self::Interrupted => f.write_str("requires reload after an interrupted operation"),
             Self::Background(cause) => write!(f, "an error occured in a background task: {cause}"),
         }
     }
@@ -61,12 +77,6 @@ impl fmt::Debug for Error {
 }
 
 impl std::error::Error for Error {}
-
-impl From<tokio::task::JoinError> for Error {
-    fn from(cause: tokio::task::JoinError) -> Self {
-        Self::Background(cause.to_string())
-    }
-}
 
 impl From<tokio::sync::AcquireError> for Error {
     fn from(_: tokio::sync::AcquireError) -> Self {
