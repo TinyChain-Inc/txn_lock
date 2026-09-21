@@ -376,22 +376,6 @@ where
             }
         }
     }
-
-    /// Resolve one transaction without introducing a new write reservation.
-    /// Reject live permits in that transaction; other transactions are unaffected.
-    /// The synchronous decision runs under reservation exclusion and must not reenter
-    /// this semaphore or perform I/O. On error, preserve reservations for the caller.
-    pub fn try_resolve<T>(&self, txn_id: &I, decide: impl FnOnce() -> Result<T>) -> Result<T> {
-        let result = {
-            let mut versions = self.versions.lock().expect("versions");
-            let _permits = versions.get(txn_id).map(Version::try_lock).transpose()?;
-            let result = decide()?;
-            versions.remove(txn_id);
-            result
-        };
-        self.notify.notify_waiters();
-        Ok(result)
-    }
 }
 
 impl<I: Copy + Ord + fmt::Debug, C, R> Semaphore<I, C, R> {
@@ -427,38 +411,5 @@ impl<I: Copy + Ord + fmt::Debug, C, R> Semaphore<I, C, R> {
 
             self.notify.notify_waiters();
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{Error, Semaphore};
-    use collate::Collator;
-
-    #[tokio::test]
-    async fn resolution_excludes_live_work_without_reserving_other_transactions() {
-        let semaphore = Semaphore::new(Collator::<usize>::default());
-        let own = semaphore.try_write(1_u64, 0..2).unwrap();
-        drop(semaphore.try_write(1, 4..6).unwrap());
-        let future = semaphore.try_write(2, 8..10).unwrap();
-        let mut waiting = Box::pin(semaphore.read(2, 0..2));
-        assert!(futures::poll!(&mut waiting).is_pending());
-        assert_eq!(
-            semaphore.try_resolve(&1, || panic!("live permit")),
-            Err::<(), _>(Error::WouldBlock)
-        );
-        drop(own);
-        assert_eq!(
-            semaphore.try_resolve(&1, || Err::<(), _>(Error::Failed)),
-            Err(Error::Failed)
-        );
-        assert!(futures::poll!(&mut waiting).is_pending());
-        semaphore.try_resolve(&1, || Ok(())).unwrap();
-        let reader = waiting.await.unwrap();
-        assert_eq!(semaphore.try_resolve(&2, || Ok(())), Err(Error::WouldBlock));
-        drop(reader);
-        drop(future);
-        semaphore.try_resolve(&2, || Ok(())).unwrap();
-        semaphore.try_resolve(&3, || Ok(())).unwrap();
     }
 }

@@ -32,11 +32,9 @@ above the cutoff are readable; failed and rolled-back decisions are rejected.
 Commit and rollback accept previously unseen identities and retain their decisions
 until finalization. Explicit registration remains available.
 
-`semaphore::Semaphore::try_resolve` protects a synchronous transaction decision
-against live permits in that transaction, then releases its reservations on
-success. It does not introduce a new write range or conflict with other
-transactions' reservations. The decision callback must not reenter the semaphore
-or perform I/O; errors leave reservations intact.
+`semaphore::Semaphore::finalize` releases transaction reservations after the
+resource's decision succeeds. The caller first finishes the affected operations
+and releases their permits; the semaphore does not enforce lifecycle quiescence.
 
 With sibling path dependencies available, run standalone checks from this directory:
 
