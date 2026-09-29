@@ -2,7 +2,7 @@
 A futures-aware read-write lock for Rust which supports transaction-specific versioning
 
 `queue::task::TaskQueue<I, Out>` holds ordered outputs from caller-driven work.
-Construct it with a positive per-transaction capacity, obtain a task with `start`,
+Construct it with a positive per-transaction capacity, await a task with `start`,
 record its output before executing the corresponding operation, and call
 `complete` only after success. Dropping a task fails its transaction; no work is
 spawned or detached. Callers separately bound the number of live transactions.
@@ -14,10 +14,13 @@ previous task is unfinished returns `Busy`. Admission changes its status from
 `Active` to `Running`; completion restores `Active`, and unfinished drop marks
 `Failed`. This is the authoritative queue status, not a collection lock or counter.
 
-An exclusive operation permit provides fallible commit, rollback, and cutoff
+Awaiting `operation` provides exclusive access for fallible commit, rollback, and cutoff
 finalization. Commit seals outputs and arms the permit; callers arm it explicitly
 before other external effects. An armed permit must be completed, or all clones
-become unusable. The caller owns recovery or shutdown. See the API documentation
+become unusable. A single semaphore owns exclusion; interruption closes it and
+wakes waiting callers with an error. Waiting for admission registers no work,
+and cancellation while waiting selects no decision. Callers bound waiting work
+and enforce their original deadline. The caller owns recovery or shutdown. See the API documentation
 in [`src/queue/task.rs`](src/queue/task.rs) for decision and cancellation semantics.
 Commit and rollback require their transaction's tasks to finish. Call
 `check_finalize(cutoff)` before external finalization; only covered tasks must

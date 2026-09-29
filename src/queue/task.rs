@@ -6,18 +6,22 @@
 //! ```
 //! use txn_lock::queue::task::TaskQueue;
 //!
+//! # async fn example() {
 //! let queue = TaskQueue::<u64, &str>::new(16);
-//! let mut task = queue.start(1).unwrap();
+//! let mut task = queue.start(1).await.unwrap();
 //! task.record("mutation").unwrap();
 //! // Execute the operation represented by the record here.
 //! task.complete().unwrap();
-//! let mut operation = queue.operation().unwrap();
+//! let mut operation = queue.operation().await.unwrap();
 //! assert_eq!(operation.commit(&1).unwrap(), Some(vec!["mutation"]));
 //! operation.complete();
+//! # }
 //! ```
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard};
+
+use tokio::sync::{Semaphore, SemaphorePermit};
 
 use crate::Error;
 
@@ -35,36 +39,35 @@ struct Entry<O> {
     outputs: Vec<O>,
 }
 
-#[derive(PartialEq, Eq)]
-enum Owner {
-    Ready,
-    Busy,
-    Interrupted,
-}
-
 struct State<I, O> {
-    owner: Owner,
     finalized: Option<I>,
     entries: BTreeMap<I, Entry<O>>,
 }
 
 impl<I: Ord, O> State<I, O> {
-    fn ready(&self) -> Result<(), Error> {
-        match self.owner {
-            Owner::Ready => Ok(()),
-            Owner::Busy => Err(Error::Busy),
-            Owner::Interrupted => Err(Error::Interrupted),
-        }
-    }
-
     fn check(&self, id: &I) -> Result<(), Error> {
-        if self.owner == Owner::Interrupted {
-            Err(Error::Interrupted)
-        } else if self.finalized.as_ref().is_some_and(|cutoff| id <= cutoff) {
+        if self.finalized.as_ref().is_some_and(|cutoff| id <= cutoff) {
             Err(Error::Outdated)
         } else {
             Ok(())
         }
+    }
+
+    fn check_start(&self, id: &I, capacity: usize) -> Result<(), Error> {
+        self.check(id)?;
+        if let Some(entry) = self.entries.get(id) {
+            match entry.status {
+                Status::Active => {}
+                Status::Running => return Err(Error::Busy),
+                Status::Failed => return Err(Error::Failed),
+                Status::Committed => return Err(Error::Committed),
+                Status::RolledBack => return Err(Error::RolledBack),
+            }
+            if entry.outputs.len() == capacity {
+                return Err(Error::Saturated);
+            }
+        }
+        Ok(())
     }
 
     fn admit(&mut self, id: I) -> Result<&mut Entry<O>, Error> {
@@ -81,19 +84,24 @@ impl<I: Ord, O> State<I, O> {
     }
 }
 
+struct Shared<I, O> {
+    state: Mutex<State<I, O>>,
+    preparation: Semaphore,
+}
+
 /// Pending outputs and live decisions for one transactional owner.
 /// Capacity bounds outputs per transaction; the caller separately bounds live transactions.
 /// Clones share one owner. An interrupted operation makes every clone unusable.
 pub struct TaskQueue<I, O> {
     capacity: usize,
-    state: Arc<Mutex<State<I, O>>>,
+    shared: Arc<Shared<I, O>>,
 }
 
 impl<I, O> Clone for TaskQueue<I, O> {
     fn clone(&self) -> Self {
         Self {
             capacity: self.capacity,
-            state: self.state.clone(),
+            shared: self.shared.clone(),
         }
     }
 }
@@ -104,22 +112,34 @@ impl<I: Ord, O> TaskQueue<I, O> {
         assert!(capacity > 0, "task queue capacity must be positive");
         Self {
             capacity,
-            state: Arc::new(Mutex::new(State {
-                owner: Owner::Ready,
-                finalized: None,
-                entries: BTreeMap::new(),
-            })),
+            shared: Arc::new(Shared {
+                state: Mutex::new(State {
+                    finalized: None,
+                    entries: BTreeMap::new(),
+                }),
+                preparation: Semaphore::new(1),
+            }),
         }
     }
 
-    fn state(&self) -> MutexGuard<'_, State<I, O>> {
-        self.state.lock().expect("task queue state")
+    fn state(&self) -> Result<MutexGuard<'_, State<I, O>>, Error> {
+        let state = self.shared.state.lock().expect("task queue state");
+        if self.shared.preparation.is_closed() {
+            Err(Error::Interrupted)
+        } else {
+            Ok(state)
+        }
     }
 
     /// Require an unused queue before delegating it to a new owner.
     pub fn validate_fresh(&self) -> Result<(), Error> {
-        let state = self.state();
-        if state.owner == Owner::Ready && state.finalized.is_none() && state.entries.is_empty() {
+        let _permit = self
+            .shared
+            .preparation
+            .try_acquire()
+            .map_err(|_| Error::Conflict)?;
+        let state = self.state()?;
+        if state.finalized.is_none() && state.entries.is_empty() {
             Ok(())
         } else {
             Err(Error::Conflict)
@@ -128,12 +148,12 @@ impl<I: Ord, O> TaskQueue<I, O> {
 
     /// Register an identity without retaining the caller's transaction capability.
     pub fn register(&self, id: I) -> Result<(), Error> {
-        self.state().admit(id).map(|_| ())
+        self.state()?.admit(id).map(|_| ())
     }
 
     /// Check an observation without registration, rejecting failed or rolled-back transactions.
     pub fn readable(&self, id: I) -> Result<(), Error> {
-        let state = self.state();
+        let state = self.state()?;
         state.check(&id)?;
         match state.entries.get(&id).map(|entry| entry.status) {
             Some(Status::Failed) => Err(Error::Failed),
@@ -145,46 +165,39 @@ impl<I: Ord, O> TaskQueue<I, O> {
     /// Reserve one output before preparation. Recording releases preparation exclusion;
     /// execution then overlaps other transactions. Requests within one transaction
     /// remain ordered so execution and replay cannot disagree.
-    pub fn start(&self, id: I) -> Result<Task<'_, I, O>, Error>
+    /// Waiting for preparation ownership registers no work. The caller bounds live
+    /// admissions and enforces its deadline by cancelling this future.
+    pub async fn start(&self, id: I) -> Result<Task<'_, I, O>, Error>
     where
         I: Clone,
     {
+        self.state()?.check_start(&id, self.capacity)?;
+        let preparation = self.operation().await?;
         {
-            let mut state = self.state();
-            state.ready()?;
-            let entry = state.admit(id.clone())?;
-            match entry.status {
-                Status::Active => {}
-                Status::Running => return Err(Error::Busy),
-                Status::Failed => return Err(Error::Failed),
-                Status::Committed => return Err(Error::Committed),
-                Status::RolledBack => return Err(Error::RolledBack),
-            }
-            if entry.outputs.len() == self.capacity {
-                return Err(Error::Saturated);
-            }
-            entry.status = Status::Running;
-            state.owner = Owner::Busy;
+            let mut state = self.state()?;
+            // A decision or another task may have completed while admission waited.
+            state.check_start(&id, self.capacity)?;
+            state.admit(id.clone())?.status = Status::Running;
         }
         Ok(Task {
             queue: self,
-            preparation: Some(Operation {
-                queue: self,
-                armed: false,
-            }),
+            preparation: Some(preparation),
             id: Some(id),
         })
     }
 
-    /// Exclude preparation and other lifecycle operations, but not task execution.
-    pub fn operation(&self) -> Result<Operation<'_, I, O>, Error> {
-        {
-            let mut state = self.state();
-            state.ready()?;
-            state.owner = Owner::Busy;
-        }
+    /// Await exclusive preparation/lifecycle ownership, without excluding task execution.
+    /// Cancelling before acquisition selects no decision and does not interrupt the owner.
+    pub async fn operation(&self) -> Result<Operation<'_, I, O>, Error> {
+        let permit = self
+            .shared
+            .preparation
+            .acquire()
+            .await
+            .map_err(|_| Error::Interrupted)?;
         Ok(Operation {
             queue: self,
+            _permit: permit,
             armed: false,
         })
     }
@@ -206,7 +219,7 @@ impl<I: Ord, O> Task<'_, I, O> {
             return Err(Error::Conflict);
         }
         {
-            let mut state = self.queue.state();
+            let mut state = self.queue.state()?;
             let entry = state.entry(self.id.as_ref().expect("active task"))?;
             entry.outputs.push(output);
         }
@@ -220,7 +233,7 @@ impl<I: Ord, O> Task<'_, I, O> {
             return Err(Error::Failed);
         }
         {
-            let mut state = self.queue.state();
+            let mut state = self.queue.state()?;
             state.entry(self.id.as_ref().expect("active task"))?.status = Status::Active;
         }
         self.id.take();
@@ -232,7 +245,7 @@ impl<I: Ord, O> Drop for Task<'_, I, O> {
     fn drop(&mut self) {
         if let Some(id) = &self.id {
             // Lifecycle cannot remove an entry while this task owns execution.
-            let mut state = self.queue.state();
+            let mut state = self.queue.shared.state.lock().expect("task queue state");
             state.entries.get_mut(id).expect("active task").status = Status::Failed;
         }
     }
@@ -243,6 +256,7 @@ impl<I: Ord, O> Drop for Task<'_, I, O> {
 /// The caller owns recovery or shutdown policy; the queue cannot repair external effects.
 pub struct Operation<'a, I: Ord, O> {
     queue: &'a TaskQueue<I, O>,
+    _permit: SemaphorePermit<'a>,
     armed: bool,
 }
 
@@ -260,7 +274,7 @@ impl<I: Ord, O> Operation<'_, I, O> {
     where
         I: Clone,
     {
-        let mut state = self.queue.state();
+        let mut state = self.queue.state()?;
         let entry = state.admit(id.clone())?;
         match entry.status {
             Status::Committed => return Ok(None),
@@ -277,7 +291,7 @@ impl<I: Ord, O> Operation<'_, I, O> {
     /// Validate rollback before the caller delegates its external effect.
     /// An unseen identity above the cutoff is eligible for rollback.
     pub fn check_rollback(&self, id: &I) -> Result<bool, Error> {
-        let state = self.queue.state();
+        let state = self.queue.state()?;
         state.check(id)?;
         match state.entries.get(id).map(|entry| entry.status) {
             Some(Status::Running) => Err(Error::Busy),
@@ -293,7 +307,7 @@ impl<I: Ord, O> Operation<'_, I, O> {
         I: Clone,
     {
         self.check_rollback(id)?;
-        let mut state = self.queue.state();
+        let mut state = self.queue.state()?;
         let entry = state.admit(id.clone())?;
         entry.status = Status::RolledBack;
         entry.outputs = Vec::new();
@@ -303,7 +317,7 @@ impl<I: Ord, O> Operation<'_, I, O> {
     /// Check covered tasks before the caller finalizes external state.
     pub fn check_finalize(&self, cutoff: &I) -> Result<(), Error> {
         self.queue
-            .state()
+            .state()?
             .entries
             .range(..=cutoff)
             .try_for_each(|(_, entry)| match entry.status {
@@ -315,7 +329,7 @@ impl<I: Ord, O> Operation<'_, I, O> {
     /// Advance the cutoff after the caller's finalization succeeds; older cutoffs are no-ops.
     pub fn finalize(&mut self, cutoff: I) -> Result<(), Error> {
         self.check_finalize(&cutoff)?;
-        let mut state = self.queue.state();
+        let mut state = self.queue.state()?;
         if state
             .finalized
             .as_ref()
@@ -335,6 +349,7 @@ impl<I: Ord, O> Operation<'_, I, O> {
     {
         self.queue
             .state()
+            .unwrap()
             .entries
             .values()
             .flat_map(|entry| entry.outputs.iter().cloned())
@@ -349,11 +364,11 @@ impl<I: Ord, O> Operation<'_, I, O> {
 
 impl<I: Ord, O> Drop for Operation<'_, I, O> {
     fn drop(&mut self) {
-        self.queue.state().owner = if self.armed {
-            Owner::Interrupted
-        } else {
-            Owner::Ready
-        };
+        if self.armed {
+            // Serialize closure with health checks before releasing the permit.
+            let _state = self.queue.shared.state.lock().expect("task queue state");
+            self.queue.shared.preparation.close();
+        }
     }
 }
 
@@ -362,13 +377,14 @@ mod tests {
     use super::TaskQueue;
     use crate::Error;
 
-    #[test]
-    fn admission_order_capacity_and_decisions() {
+    #[tokio::test]
+    async fn admission_order_capacity_and_decisions() {
         let queue = TaskQueue::new(2);
         for output in [10, 20] {
-            let mut task = queue.start(1).unwrap();
-            assert_eq!(queue.operation().err(), Some(Error::Busy));
-            assert_eq!(queue.start(2).err(), Some(Error::Busy));
+            let mut task = queue.start(1).await.unwrap();
+            assert!(futures::poll!(Box::pin(queue.operation())).is_pending());
+            assert!(futures::poll!(Box::pin(queue.start(2))).is_pending());
+            assert_eq!(queue.start(1).await.err(), Some(Error::Busy));
             assert_eq!(queue.readable(1), Ok(()));
             queue.register(2).unwrap();
             task.record(output).unwrap();
@@ -376,30 +392,30 @@ mod tests {
             assert_eq!(task.record(99), Err(Error::Conflict));
             task.complete().unwrap();
         }
-        assert_eq!(queue.start(1).err(), Some(Error::Saturated));
-        let mut operation = queue.operation().unwrap();
+        assert_eq!(queue.start(1).await.err(), Some(Error::Saturated));
+        let mut operation = queue.operation().await.unwrap();
         assert_eq!(operation.commit(&1).unwrap(), Some(vec![10, 20]));
         assert!(operation.pending().is_empty());
         operation.complete();
 
-        let mut operation = queue.operation().unwrap();
+        let mut operation = queue.operation().await.unwrap();
         assert_eq!(operation.commit(&1).unwrap(), None);
         assert_eq!(operation.check_rollback(&1), Err(Error::Committed));
         assert_eq!(operation.rollback(&1), Err(Error::Committed));
         operation.complete();
-        assert_eq!(queue.start(1).err(), Some(Error::Committed));
-        let mut task = queue.start(2).unwrap();
+        assert_eq!(queue.start(1).await.err(), Some(Error::Committed));
+        let mut task = queue.start(2).await.unwrap();
         task.record(30).unwrap();
         task.complete().unwrap();
     }
 
-    #[test]
-    fn failed_tasks_retain_outputs_until_rollback_or_cutoff() {
+    #[tokio::test]
+    async fn failed_tasks_retain_outputs_until_rollback_or_cutoff() {
         let queue = TaskQueue::new(1);
-        assert_eq!(queue.start(1).unwrap().complete(), Err(Error::Failed));
+        assert_eq!(queue.start(1).await.unwrap().complete(), Err(Error::Failed));
         assert_eq!(queue.readable(1), Err(Error::Failed));
         {
-            let mut operation = queue.operation().unwrap();
+            let mut operation = queue.operation().await.unwrap();
             assert_eq!(operation.commit(&1), Err(Error::Failed));
             assert!(operation.pending().is_empty());
             assert!(operation.check_rollback(&1).unwrap());
@@ -409,10 +425,10 @@ mod tests {
             assert_eq!(operation.commit(&1), Err(Error::RolledBack));
         }
         assert_eq!(queue.readable(1), Err(Error::RolledBack));
-        let mut task = queue.start(2).unwrap();
+        let mut task = queue.start(2).await.unwrap();
         task.record(42).unwrap();
         drop(task);
-        let mut operation = queue.operation().unwrap();
+        let mut operation = queue.operation().await.unwrap();
         assert_eq!(operation.pending(), vec![42]);
         assert_eq!(operation.commit(&2), Err(Error::Failed));
         operation.finalize(2).unwrap();
@@ -423,20 +439,20 @@ mod tests {
         assert_eq!(operation.rollback(&2), Err(Error::Outdated));
         operation.complete();
         assert_eq!(queue.register(1), Err(Error::Outdated));
-        assert!(queue.start(3).is_ok());
+        assert!(queue.start(3).await.is_ok());
     }
 
-    #[test]
-    fn finalization_preserves_future_outputs_and_read_only_receipts() {
+    #[tokio::test]
+    async fn finalization_preserves_future_outputs_and_read_only_receipts() {
         let queue = TaskQueue::<u64, u64>::new(1);
         queue.register(1).unwrap();
-        let mut operation = queue.operation().unwrap();
+        let mut operation = queue.operation().await.unwrap();
         assert_eq!(operation.commit(&1).unwrap(), Some(vec![]));
         operation.complete();
-        let mut task = queue.start(3).unwrap();
+        let mut task = queue.start(3).await.unwrap();
         task.record(30).unwrap();
         task.complete().unwrap();
-        let mut operation = queue.operation().unwrap();
+        let mut operation = queue.operation().await.unwrap();
         operation.finalize(2).unwrap();
         assert_eq!(operation.pending(), vec![30]);
         assert_eq!(operation.commit(&1), Err(Error::Outdated));
@@ -444,16 +460,16 @@ mod tests {
         operation.complete();
     }
 
-    #[test]
-    fn execution_overlaps_without_blocking_other_transaction_decisions() {
+    #[tokio::test]
+    async fn execution_overlaps_without_blocking_other_transaction_decisions() {
         let queue = TaskQueue::new(2);
-        let mut first = queue.start(1).unwrap();
+        let mut first = queue.start(1).await.unwrap();
         first.record(10).unwrap();
-        assert_eq!(queue.start(1).err(), Some(Error::Busy));
-        let mut later = queue.start(2).unwrap();
+        assert_eq!(queue.start(1).await.err(), Some(Error::Busy));
+        let mut later = queue.start(2).await.unwrap();
         later.record(30).unwrap();
         {
-            let mut operation = queue.operation().unwrap();
+            let mut operation = queue.operation().await.unwrap();
             assert_eq!(operation.commit(&1), Err(Error::Busy));
             assert_eq!(operation.check_rollback(&1), Err(Error::Busy));
             assert_eq!(operation.check_finalize(&1), Err(Error::Busy));
@@ -461,49 +477,49 @@ mod tests {
             assert_eq!(operation.pending(), vec![10, 30]);
         }
         first.complete().unwrap();
-        let mut second = queue.start(1).unwrap();
+        let mut second = queue.start(1).await.unwrap();
         second.record(20).unwrap();
         second.complete().unwrap();
-        assert_eq!(queue.start(1).err(), Some(Error::Saturated));
-        let mut operation = queue.operation().unwrap();
+        assert_eq!(queue.start(1).await.err(), Some(Error::Saturated));
+        let mut operation = queue.operation().await.unwrap();
         assert_eq!(operation.commit(&1).unwrap(), Some(vec![10, 20]));
         operation.finalize(1).unwrap();
         operation.complete();
         later.complete().unwrap();
-        let mut operation = queue.operation().unwrap();
+        let mut operation = queue.operation().await.unwrap();
         assert_eq!(operation.commit(&2).unwrap(), Some(vec![30]));
         operation.complete();
     }
 
-    #[test]
-    fn failure_does_not_exclude_other_transactions() {
+    #[tokio::test]
+    async fn failure_does_not_exclude_other_transactions() {
         let queue = TaskQueue::new(2);
-        let mut first = queue.start(1).unwrap();
+        let mut first = queue.start(1).await.unwrap();
         first.record(10).unwrap();
-        let mut second = queue.start(2).unwrap();
+        let mut second = queue.start(2).await.unwrap();
         second.record(20).unwrap();
         drop(first);
         second.complete().unwrap();
-        let mut operation = queue.operation().unwrap();
+        let mut operation = queue.operation().await.unwrap();
         assert_eq!(operation.commit(&1), Err(Error::Failed));
         assert_eq!(operation.pending(), vec![10, 20]);
         operation.rollback(&1).unwrap();
         assert_eq!(operation.commit(&2).unwrap(), Some(vec![20]));
         operation.complete();
-        let mut independent = queue.start(3).unwrap();
+        let mut independent = queue.start(3).await.unwrap();
         independent.record(30).unwrap();
         independent.complete().unwrap();
     }
 
-    #[test]
-    fn interruption_invalidates_all_clones_and_sealed_commits() {
+    #[tokio::test]
+    async fn interruption_invalidates_all_clones_and_sealed_commits() {
         for sealing in [false, true] {
             let queue = TaskQueue::<u64, u64>::new(1);
             let clone = queue.clone();
             queue.register(1).unwrap();
-            let mut live = queue.start(3).unwrap();
+            let mut live = queue.start(3).await.unwrap();
             live.record(30).unwrap();
-            let mut operation = queue.operation().unwrap();
+            let mut operation = queue.operation().await.unwrap();
             if sealing {
                 operation.commit(&1).unwrap();
             } else {
@@ -517,14 +533,14 @@ mod tests {
             }
             assert_eq!(clone.register(2), Err(Error::Interrupted));
             assert_eq!(clone.readable(1), Err(Error::Interrupted));
-            assert_eq!(clone.start(2).err(), Some(Error::Interrupted));
-            assert_eq!(clone.operation().err(), Some(Error::Interrupted));
+            assert_eq!(clone.start(2).await.err(), Some(Error::Interrupted));
+            assert_eq!(clone.operation().await.err(), Some(Error::Interrupted));
             assert!(clone.validate_fresh().is_err());
         }
     }
 
-    #[test]
-    fn rejected_decisions_do_not_interrupt_and_freshness_is_strict() {
+    #[tokio::test]
+    async fn rejected_decisions_do_not_interrupt_and_freshness_is_strict() {
         let queue = TaskQueue::<u64, u64>::new(1);
         queue.validate_fresh().unwrap();
         for id in 1..100 {
@@ -532,7 +548,7 @@ mod tests {
         }
         queue.validate_fresh().unwrap();
         {
-            let mut operation = queue.operation().unwrap();
+            let mut operation = queue.operation().await.unwrap();
             assert_eq!(operation.commit(&1), Ok(Some(vec![])));
             assert_eq!(operation.commit(&1), Ok(None));
             assert_eq!(operation.check_rollback(&1), Err(Error::Committed));
@@ -546,21 +562,47 @@ mod tests {
         assert_eq!(queue.readable(2), Err(Error::RolledBack));
         queue.register(1).unwrap();
         assert!(queue.validate_fresh().is_err());
-        let mut operation = queue.operation().unwrap();
+        let mut operation = queue.operation().await.unwrap();
         operation.finalize(2).unwrap();
         operation.complete();
         assert_eq!(queue.readable(2), Err(Error::Outdated));
-        assert_eq!(queue.start(2).err(), Some(Error::Outdated));
+        assert_eq!(queue.start(2).await.err(), Some(Error::Outdated));
         {
-            let operation = queue.operation().unwrap();
-            assert_eq!(queue.start(2).err(), Some(Error::Busy));
+            let operation = queue.operation().await.unwrap();
+            assert_eq!(queue.start(2).await.err(), Some(Error::Outdated));
             operation.complete();
         }
         assert_eq!(queue.readable(3), Ok(()));
-        let mut task = queue.start(3).unwrap();
+        let mut task = queue.start(3).await.unwrap();
         task.record(7).unwrap();
         task.complete().unwrap();
         assert!(queue.validate_fresh().is_err());
+    }
+
+    #[tokio::test]
+    async fn waiting_owns_no_work_and_revalidates_after_acquisition() {
+        let queue = TaskQueue::<u64, u64>::new(1);
+        let mut operation = queue.operation().await.unwrap();
+        {
+            let mut waiting = Box::pin(queue.start(1));
+            assert!(futures::poll!(&mut waiting).is_pending());
+        }
+        assert!(queue.state().unwrap().entries.is_empty());
+        let mut waiting = Box::pin(queue.start(2));
+        assert!(futures::poll!(&mut waiting).is_pending());
+        operation.finalize(2).unwrap();
+        operation.complete();
+        assert_eq!(waiting.await.err(), Some(Error::Outdated));
+
+        let mut operation = queue.operation().await.unwrap();
+        let mut task = Box::pin(queue.start(3));
+        let mut decision = Box::pin(queue.operation());
+        assert!(futures::poll!(&mut task).is_pending());
+        assert!(futures::poll!(&mut decision).is_pending());
+        operation.arm();
+        drop(operation);
+        assert_eq!(task.await.err(), Some(Error::Interrupted));
+        assert_eq!(decision.await.err(), Some(Error::Interrupted));
     }
 
     #[tokio::test]
@@ -569,7 +611,7 @@ mod tests {
             let queue = TaskQueue::new(1);
             let completed = std::sync::atomic::AtomicBool::new(false);
             let mut future = Box::pin(async {
-                let mut task = queue.start(1).unwrap();
+                let mut task = queue.start(1).await.unwrap();
                 if recorded {
                     task.record(7).unwrap();
                 }
@@ -581,13 +623,13 @@ mod tests {
             drop(future);
             tokio::task::yield_now().await;
             assert!(!completed.load(std::sync::atomic::Ordering::Relaxed));
-            let mut operation = queue.operation().unwrap();
+            let mut operation = queue.operation().await.unwrap();
             assert_eq!(operation.pending().len(), usize::from(recorded));
             assert_eq!(operation.commit(&1), Err(Error::Failed));
             operation.rollback(&1).unwrap();
             assert!(operation.pending().is_empty());
             operation.complete();
-            let mut task = queue.start(2).unwrap();
+            let mut task = queue.start(2).await.unwrap();
             task.record(8).unwrap();
             task.complete().unwrap();
         }
