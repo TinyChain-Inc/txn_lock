@@ -46,9 +46,6 @@ pub enum Error {
 
     /// An armed operation did not complete; this owner cannot safely resume.
     Interrupted,
-
-    /// An error occurred in a delegated operation.
-    Background(String),
 }
 
 impl fmt::Display for Error {
@@ -65,7 +62,6 @@ impl fmt::Display for Error {
             Self::Failed => f.write_str("transaction contains a failed or cancelled task"),
             Self::RolledBack => f.write_str("transaction was rolled back"),
             Self::Interrupted => f.write_str("requires reload after an interrupted operation"),
-            Self::Background(cause) => write!(f, "an error occured in a background task: {cause}"),
         }
     }
 }

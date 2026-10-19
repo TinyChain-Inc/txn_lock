@@ -1,684 +1,157 @@
-use std::marker::PhantomData;
 use std::ops::Deref;
-use std::pin::Pin;
-use std::sync::{Arc, Mutex};
-use std::{fmt, mem};
+use std::sync::Arc;
 
 use collate::{Collate, Overlap, OverlapsRange};
-use futures::future::{self, Future, TryFutureExt};
-use futures::try_join;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use crate::Result;
+use crate::{Error, Result};
 
 const PERMITS: u32 = u32::MAX >> 3;
 
-type BoxTryFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
-
-struct NodePermit {
-    _permit: OwnedSemaphorePermit,
-    children: [Option<Box<NodePermit>>; 5],
-}
-
-impl fmt::Debug for NodePermit {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let children = self.children.iter().filter_map(|c| c.as_ref()).count();
-        write!(f, "permit for node with {} children", children)
-    }
-}
-
-/// A transactional semaphore permit
-pub struct Permit<R> {
+/// An active capability for exactly one registered range.
+#[derive(Debug)]
+pub(super) struct Permit<R> {
     range: Arc<R>,
-    permit: NodePermit,
+    _permit: OwnedSemaphorePermit,
 }
 
 impl<R> Deref for Permit<R> {
     type Target = R;
 
-    fn deref(&self) -> &Self::Target {
-        self.range.deref()
+    fn deref(&self) -> &R {
+        &self.range
     }
 }
 
-impl<R: fmt::Debug> fmt::Debug for Permit<R> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "permit for {:?} with {:?}", self.range, self.permit)
-    }
-}
-
-/// A node in a 5-ary tree of overlapping ranges
-pub struct RangeLock<C, R> {
+struct Reservation<R> {
     range: Arc<R>,
+    write: bool,
     semaphore: Arc<Semaphore>,
-    write: Arc<Mutex<bool>>,
-
-    left: Option<Box<Self>>,
-    left_partial: Option<Box<Self>>,
-    center: Option<Box<Self>>,
-    right_partial: Option<Box<Self>>,
-    right: Option<Box<Self>>,
-
-    phantom: PhantomData<C>,
 }
 
-impl<C, R> Clone for RangeLock<C, R> {
-    fn clone(&self) -> Self {
+/// Exact historical reservations within one transaction. The containing
+/// Semaphore's mutex serializes registration, conflict checks, and acquisition.
+pub(super) struct Version<R> {
+    reservations: Vec<Reservation<R>>,
+}
+
+impl<R> Version<R> {
+    pub fn new() -> Self {
         Self {
-            range: self.range.clone(),
-            semaphore: self.semaphore.clone(),
-            write: self.write.clone(),
-
-            left: self.left.clone(),
-            left_partial: self.left_partial.clone(),
-            center: self.center.clone(),
-            right_partial: self.right_partial.clone(),
-            right: self.right.clone(),
-
-            phantom: PhantomData,
-        }
-    }
-}
-
-impl<C, R> RangeLock<C, R> {
-    fn new(range: Arc<R>, write: bool) -> Self {
-        let semaphore = Arc::new(Semaphore::new(PERMITS as usize));
-
-        Self {
-            range,
-            semaphore,
-            write: Arc::new(Mutex::new(write)),
-            left: None,
-            left_partial: None,
-            center: None,
-            right_partial: None,
-            right: None,
-            phantom: PhantomData,
+            reservations: Vec::new(),
         }
     }
 
-    fn is_pending_write(&self) -> bool {
-        let write_flag = self.write.lock().expect("write bit");
-
-        if *write_flag {
-            return true;
-        }
-
-        [
-            &self.left,
-            &self.left_partial,
-            &self.center,
-            &self.right_partial,
-            &self.right,
-        ]
-        .into_iter()
-        .filter_map(|node| node.as_ref())
-        .any(|node| node.is_pending_write())
-    }
-
-    #[inline]
-    fn reserve(&self, write: bool) {
-        let mut flag = self.write.lock().expect("write flag");
-        *flag = *flag || write;
-    }
-}
-
-impl<C: Send + Sync, R: Send + Sync> RangeLock<C, R> {
-    fn acquire(&self) -> BoxTryFuture<'_, NodePermit> {
-        Box::pin(async move {
-            let permit = self.semaphore.clone().acquire_owned().await?;
-
-            #[inline]
-            fn child_lock<C, R>(
-                node: Option<&RangeLock<C, R>>,
-            ) -> BoxTryFuture<'_, Option<Box<NodePermit>>>
-            where
-                C: Send + Sync,
-                R: Send + Sync,
-            {
-                if let Some(node) = node {
-                    Box::pin(node.acquire().map_ok(Box::new).map_ok(Some))
-                } else {
-                    Box::pin(future::ready(Ok(None)))
-                }
-            }
-
-            let (left, left_partial, center, right_partial, right) = try_join!(
-                child_lock(self.left.as_deref()),
-                child_lock(self.left_partial.as_deref()),
-                child_lock(self.center.as_deref()),
-                child_lock(self.right_partial.as_deref()),
-                child_lock(self.right.as_deref()),
-            )?;
-
-            Ok(NodePermit {
-                _permit: permit,
-                children: [left, left_partial, center, right_partial, right],
-            })
-        })
-    }
-
-    fn try_acquire(&self) -> Result<NodePermit> {
-        let permit = self.semaphore.clone().try_acquire_owned()?;
-
-        #[inline]
-        fn child_lock<C, R>(node: Option<&RangeLock<C, R>>) -> Result<Option<Box<NodePermit>>>
-        where
-            C: Send + Sync,
-            R: Send + Sync,
+    pub fn reserve<C>(&mut self, range: Arc<R>, write: bool, collator: &C) -> usize
+    where
+        C: Collate,
+        R: OverlapsRange<R, C>,
+    {
+        if let Some(index) = self
+            .reservations
+            .iter()
+            .position(|reservation| reservation.range.overlaps(&range, collator) == Overlap::Equal)
         {
-            if let Some(node) = node {
-                node.try_acquire().map(Box::new).map(Some)
-            } else {
-                Ok(None)
-            }
-        }
-
-        Ok(NodePermit {
-            _permit: permit,
-            children: [
-                child_lock(self.left.as_deref())?,
-                child_lock(self.left_partial.as_deref())?,
-                child_lock(self.center.as_deref())?,
-                child_lock(self.right_partial.as_deref())?,
-                child_lock(self.right.as_deref())?,
-            ],
-        })
-    }
-
-    fn acquire_many(&self, permits: u32) -> BoxTryFuture<'_, NodePermit> {
-        Box::pin(async move {
-            let permit = self.semaphore.clone().acquire_many_owned(permits).await?;
-
-            #[inline]
-            fn child_lock<C, R>(
-                node: Option<&RangeLock<C, R>>,
-                permits: u32,
-            ) -> BoxTryFuture<'_, Option<Box<NodePermit>>>
-            where
-                C: Send + Sync,
-                R: Send + Sync,
-            {
-                if let Some(node) = node {
-                    Box::pin(node.acquire_many(permits).map_ok(Box::new).map_ok(Some))
-                } else {
-                    Box::pin(future::ready(Ok(None)))
-                }
-            }
-
-            let (left, left_partial, center, right_partial, right) = try_join!(
-                child_lock(self.left.as_deref(), permits),
-                child_lock(self.left_partial.as_deref(), permits),
-                child_lock(self.center.as_deref(), permits),
-                child_lock(self.right_partial.as_deref(), permits),
-                child_lock(self.right.as_deref(), permits),
-            )?;
-
-            Ok(NodePermit {
-                _permit: permit,
-                children: [left, left_partial, center, right_partial, right],
-            })
-        })
-    }
-
-    fn try_acquire_many(&self, permits: u32) -> Result<NodePermit> {
-        let permit = self.semaphore.clone().try_acquire_many_owned(permits)?;
-
-        #[inline]
-        fn child_lock<C, R>(
-            node: Option<&RangeLock<C, R>>,
-            permits: u32,
-        ) -> Result<Option<Box<NodePermit>>>
-        where
-            C: Send + Sync,
-            R: Send + Sync,
-        {
-            if let Some(node) = node {
-                node.try_acquire_many(permits).map(Box::new).map(Some)
-            } else {
-                Ok(None)
-            }
-        }
-
-        Ok(NodePermit {
-            _permit: permit,
-            children: [
-                child_lock(self.left.as_deref(), permits)?,
-                child_lock(self.left_partial.as_deref(), permits)?,
-                child_lock(self.center.as_deref(), permits)?,
-                child_lock(self.right_partial.as_deref(), permits)?,
-                child_lock(self.right.as_deref(), permits)?,
-            ],
-        })
-    }
-}
-
-impl<C, R> RangeLock<C, R>
-where
-    C: Collate + Send + Sync,
-    R: OverlapsRange<R, C> + fmt::Debug + Send + Sync,
-{
-    fn insert<'a>(&'a mut self, collator: &'a C, mut node: Self) -> &'a Self {
-        #[cfg(feature = "logging")]
-        log::trace!("range {:?} is part of {:?}", node.range, self.range);
-
-        #[inline]
-        fn insert_node<'a, C, R>(
-            extant: &'a mut Option<Box<RangeLock<C, R>>>,
-            collator: &'a C,
-            new_node: RangeLock<C, R>,
-        ) -> &'a RangeLock<C, R>
-        where
-            C: Collate + Send + Sync,
-            R: OverlapsRange<R, C> + fmt::Debug + Send + Sync,
-        {
-            if let Some(extant) = extant {
-                extant.insert(collator, new_node)
-            } else {
-                *extant = Some(Box::new(new_node));
-                extant.as_ref().expect("new node")
-            }
-        }
-
-        match self.range.overlaps(&node.range, collator) {
-            Overlap::Equal => {
-                let write = node.write.lock().expect("write flag");
-                self.reserve(*write);
-                self
-            }
-            Overlap::Greater => insert_node(&mut self.left, collator, node),
-            Overlap::WideGreater => insert_node(&mut self.left_partial, collator, node),
-            Overlap::Wide => insert_node(&mut self.center, collator, node),
-            Overlap::WideLess => insert_node(&mut self.right_partial, collator, node),
-            Overlap::Less => insert_node(&mut self.right, collator, node),
-            Overlap::Narrow => {
-                mem::swap(self, &mut node);
-                match self.range.overlaps(&node.range, collator) {
-                    Overlap::WideGreater => insert_node(&mut self.left_partial, collator, node),
-                    Overlap::Wide => insert_node(&mut self.center, collator, node),
-                    Overlap::WideLess => insert_node(&mut self.right_partial, collator, node),
-                    _ => unreachable!("range {:?} does not contain {:?}", self.range, node.range),
-                }
-            }
-        }
-    }
-
-    /// Acquire a read lock on this [`RangeLock`] and its children.
-    pub fn read<'a>(&'a self, target: &'a R, collator: &'a C) -> BoxTryFuture<'a, Permit<R>> {
-        Box::pin(async move {
-            let overlap = self.range.overlaps(target, collator);
-
-            if overlap == Overlap::Equal {
-                return self
-                    .acquire()
-                    .map_ok(|permit| Permit {
-                        range: self.range.clone(),
-                        permit,
-                    })
-                    .await;
-            }
-
-            // make sure this range is not locked
-            let _permit = self.semaphore.acquire().await;
-
-            match overlap {
-                Overlap::Greater => {
-                    self.left
-                        .as_ref()
-                        .expect("left")
-                        .read(target, collator)
-                        .await
-                }
-                Overlap::WideGreater => {
-                    self.left_partial
-                        .as_ref()
-                        .expect("left")
-                        .read(target, collator)
-                        .await
-                }
-                Overlap::Wide => {
-                    self.center
-                        .as_ref()
-                        .expect("center")
-                        .read(target, collator)
-                        .await
-                }
-                Overlap::WideLess => {
-                    self.right_partial
-                        .as_ref()
-                        .expect("right")
-                        .read(target, collator)
-                        .await
-                }
-                Overlap::Less => {
-                    self.right
-                        .as_ref()
-                        .expect("right")
-                        .read(target, collator)
-                        .await
-                }
-                overlap => unreachable!("lock a range with overlap {:?} for reading", overlap),
-            }
-        })
-    }
-
-    /// Acquire a read lock on this [`RangeLock`] and its children synchronously, if possible.
-    pub fn try_read(&self, target: &R, collator: &C) -> Result<Permit<R>> {
-        let overlap = self.range.overlaps(target, collator);
-
-        if overlap == Overlap::Equal {
-            return self.try_acquire().map(|permit| Permit {
-                range: self.range.clone(),
-                permit,
+            self.reservations[index].write |= write;
+            index
+        } else {
+            let index = self.reservations.len();
+            self.reservations.push(Reservation {
+                range,
+                write,
+                semaphore: Arc::new(Semaphore::new(PERMITS as usize)),
             });
-        }
-
-        // make sure this range is not locked
-        let _permit = self.semaphore.try_acquire()?;
-
-        match overlap {
-            Overlap::Greater => self.left.as_ref().expect("left").try_read(target, collator),
-            Overlap::WideGreater => self
-                .left_partial
-                .as_ref()
-                .expect("left")
-                .try_read(target, collator),
-
-            Overlap::Wide => self
-                .center
-                .as_ref()
-                .expect("center")
-                .try_read(target, collator),
-
-            Overlap::WideLess => self
-                .right_partial
-                .as_ref()
-                .expect("right")
-                .try_read(target, collator),
-
-            Overlap::Less => self
-                .right
-                .as_ref()
-                .expect("right")
-                .try_read(target, collator),
-
-            overlap => unreachable!("lock a range with overlap {:?} for reading", overlap),
+            index
         }
     }
 
-    /// Acquire a write lock on this [`RangeLock`] and its children.
-    pub fn write<'a>(&'a self, target: &'a R, collator: &'a C) -> BoxTryFuture<'a, Permit<R>> {
-        Box::pin(async move {
-            let overlap = self.range.overlaps(target, collator);
-
-            if overlap == Overlap::Equal {
-                return self
-                    .acquire_many(PERMITS)
-                    .map_ok(|permit| Permit {
-                        range: self.range.clone(),
-                        permit,
-                    })
-                    .await;
+    pub fn try_acquire<C>(&mut self, range: Arc<R>, write: bool, collator: &C) -> Result<Permit<R>>
+    where
+        C: Collate,
+        R: OverlapsRange<R, C>,
+    {
+        // A same-transaction attempt retains its history even if active permits
+        // block acquisition. Cancellation must not erase that reservation.
+        let index = self.reserve(range.clone(), write, collator);
+        let blocked = self.reservations.iter().any(|reservation| {
+            if !reservation.range.contains_partial(&range, collator) {
+                return false;
             }
-
-            // make sure the target range is not locked
-            let _permit = self.semaphore.acquire().await;
-
-            match overlap {
-                Overlap::Greater => {
-                    self.left
-                        .as_ref()
-                        .expect("left")
-                        .write(target, collator)
-                        .await
-                }
-                Overlap::WideGreater => {
-                    self.left_partial
-                        .as_ref()
-                        .expect("left")
-                        .write(target, collator)
-                        .await
-                }
-                Overlap::Wide => {
-                    self.center
-                        .as_ref()
-                        .expect("center")
-                        .write(target, collator)
-                        .await
-                }
-                Overlap::WideLess => {
-                    self.right_partial
-                        .as_ref()
-                        .expect("right")
-                        .write(target, collator)
-                        .await
-                }
-                Overlap::Less => {
-                    self.right
-                        .as_ref()
-                        .expect("right")
-                        .write(target, collator)
-                        .await
-                }
-                overlap => unreachable!("lock a range with overlap {:?} for writing", overlap),
+            let available = reservation.semaphore.available_permits();
+            if write {
+                available != PERMITS as usize
+            } else {
+                available == 0
             }
+        });
+        if blocked {
+            return Err(Error::WouldBlock);
+        }
+
+        let reservation = &self.reservations[index];
+        let permit = reservation
+            .semaphore
+            .clone()
+            .try_acquire_many_owned(if write { PERMITS } else { 1 })?;
+        Ok(Permit {
+            range: reservation.range.clone(),
+            _permit: permit,
         })
     }
 
-    /// Acquire a write lock on this [`RangeLock`] and its children synchronously, if possible.
-    pub fn try_write(&self, target: &R, collator: &C) -> Result<Permit<R>> {
-        let overlap = self.range.overlaps(target, collator);
+    /// Any historical access conflicts with an earlier overlapping write.
+    pub fn has_been_read_at<C>(&self, target: &R, collator: &C) -> bool
+    where
+        C: Collate,
+        R: OverlapsRange<R, C>,
+    {
+        self.reservations
+            .iter()
+            .any(|reservation| reservation.range.contains_partial(target, collator))
+    }
 
-        if overlap == Overlap::Equal {
-            return self.try_acquire_many(PERMITS).map(|permit| Permit {
-                range: self.range.clone(),
-                permit,
-            });
-        }
-
-        // make sure the target range is not locked
-        let _permit = self.semaphore.try_acquire()?;
-
-        match overlap {
-            Overlap::Greater => self
-                .left
-                .as_ref()
-                .expect("left")
-                .try_write(target, collator),
-
-            Overlap::WideGreater => self
-                .left_partial
-                .as_ref()
-                .expect("left")
-                .try_write(target, collator),
-
-            Overlap::Wide => self
-                .center
-                .as_ref()
-                .expect("center")
-                .try_write(target, collator),
-
-            Overlap::WideLess => self
-                .right_partial
-                .as_ref()
-                .expect("right")
-                .try_write(target, collator),
-
-            Overlap::Less => self
-                .right
-                .as_ref()
-                .expect("right")
-                .try_write(target, collator),
-
-            overlap => unreachable!("lock a range with overlap {:?} for writing", overlap),
-        }
+    pub fn is_pending_write_at<C>(&self, target: &R, collator: &C) -> bool
+    where
+        C: Collate,
+        R: OverlapsRange<R, C>,
+    {
+        self.reservations.iter().any(|reservation| {
+            reservation.write && reservation.range.contains_partial(target, collator)
+        })
     }
 }
 
-impl<C, R: fmt::Debug> fmt::Debug for RangeLock<C, R> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "node {:?}", self.range)
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use collate::Collator;
 
-/// Semaphores for ranges within a single transactional version
-pub struct Version<C, R> {
-    collator: C,
-    roots: Vec<RangeLock<C, R>>,
-}
-
-impl<C, R> Version<C, R> {
-    /// Create a new [`Version`] semaphore
-    pub fn new(collator: C) -> Self {
-        Self {
-            collator,
-            roots: Vec::with_capacity(1),
+    #[test]
+    fn equal_ranges_share_one_reservation_and_preserve_write_history() {
+        let mut version = Version::new();
+        let collator = Collator::<u64>::default();
+        let read = version
+            .try_acquire(Arc::new(2..4), false, &collator)
+            .unwrap();
+        for _ in 0..64 {
+            drop(
+                version
+                    .try_acquire(Arc::new(2..4), false, &collator)
+                    .unwrap(),
+            );
+            assert!(matches!(
+                version.try_acquire(Arc::new(2..4), true, &collator),
+                Err(Error::WouldBlock)
+            ));
         }
-    }
-}
-
-impl<C: Collate + Send + Sync, R: OverlapsRange<R, C> + fmt::Debug + Send + Sync> Version<C, R> {
-    /// Create a new `range` semaphore and return its root [`RangeLock`]
-    pub fn insert(&mut self, range: Arc<R>, write: bool) -> RangeLock<C, R> {
-        #[cfg(feature = "logging")]
-        log::debug!("Version::insert {:?} (write: {})", range, write);
-
-        let insert_at = bisect_left(&self.roots, range.as_ref(), &self.collator);
-        let take_until = bisect_right(&self.roots, range.as_ref(), &self.collator);
-        assert!(take_until >= insert_at);
-
-        #[cfg(feature = "logging")]
-        log::debug!(
-            "{:?} covers {} existing ranges in this version",
-            range,
-            take_until - insert_at
+        assert_eq!(version.reservations.len(), 1);
+        assert!(version.reservations[0].write);
+        drop(read);
+        drop(
+            version
+                .try_acquire(Arc::new(2..4), true, &collator)
+                .unwrap(),
         );
-
-        if insert_at == take_until {
-            let root = RangeLock::new(range, write);
-            self.roots.insert(insert_at, root);
-        } else if take_until - insert_at == 1 {
-            let root = self.roots.get_mut(insert_at).expect("root range");
-            match root.range.overlaps(&range, &self.collator) {
-                Overlap::Equal => {
-                    root.reserve(write);
-
-                    #[cfg(feature = "logging")]
-                    log::trace!("reserved root range lock with write: {write}");
-                }
-                Overlap::WideLess | Overlap::Wide | Overlap::WideGreater => {
-                    #[cfg(feature = "logging")]
-                    log::trace!("{:?} is wide w/r/t {:?}", root.range, range);
-
-                    let node = RangeLock::new(range, write);
-                    root.insert(&self.collator, node);
-                }
-                Overlap::Narrow => {
-                    #[cfg(feature = "logging")]
-                    log::trace!("{:?} is narrow w/r/t {:?}", root.range, range);
-
-                    let node = self.roots.remove(insert_at);
-                    let mut root = RangeLock::new(range, write);
-                    root.insert(&self.collator, node);
-                    self.roots.insert(insert_at, root);
-                }
-                _ => unreachable!(),
-            }
-        } else {
-            let mut root = RangeLock::new(range, write);
-
-            for _ in insert_at..take_until {
-                let node = self.roots.remove(insert_at);
-                root.insert(&self.collator, node);
-            }
-
-            self.roots.insert(insert_at, root);
-        }
-
-        self.roots.get(insert_at).expect("range").clone()
+        assert!(version.is_pending_write_at(&(2..4), &collator));
     }
-
-    /// Return `true` if any part of the given range has been reserved for reading.
-    pub fn has_been_read_at(&self, target: &R) -> bool {
-        for root in &self.roots {
-            if root.range.contains_partial(target, &self.collator) {
-                return true;
-            }
-        }
-
-        false
-    }
-
-    /// Return `true` if any part of the given range has been reserved for writing.
-    pub fn is_pending_write_at(&self, target: &R) -> bool {
-        for root in &self.roots {
-            if root.range.contains_partial(target, &self.collator) && root.is_pending_write() {
-                return true;
-            }
-        }
-
-        false
-    }
-}
-
-#[inline]
-fn bisect_left<'a, C, R>(roots: &'a [RangeLock<C, R>], range: &'a R, collator: &'a C) -> usize
-where
-    C: Collate,
-    R: OverlapsRange<R, C> + fmt::Debug + 'a,
-{
-    if roots.is_empty()
-        || roots.first().expect("root").range.overlaps(range, collator) == Overlap::Greater
-    {
-        return 0;
-    } else if roots.last().expect("root").range.overlaps(range, collator) == Overlap::Less {
-        return roots.len();
-    }
-
-    let mut start = 0;
-    let mut end = roots.len();
-
-    while start < end {
-        let mid = (start + end) >> 1;
-
-        let node = roots.get(mid).expect("range");
-        if node.range.overlaps(range, collator) == Overlap::Less {
-            start = mid + 1;
-        } else {
-            end = mid;
-        }
-    }
-
-    start
-}
-
-#[inline]
-fn bisect_right<'a, C, R>(roots: &'a [RangeLock<C, R>], range: &'a R, collator: &'a C) -> usize
-where
-    C: Collate,
-    R: OverlapsRange<R, C> + fmt::Debug + 'a,
-{
-    if roots.is_empty()
-        || roots.first().expect("root").range.overlaps(range, collator) == Overlap::Greater
-    {
-        return 0;
-    } else if roots.last().expect("root").range.overlaps(range, collator) == Overlap::Less {
-        return roots.len();
-    }
-
-    let mut start = 0;
-    let mut end = roots.len();
-
-    while start < end {
-        let mid = (start + end) >> 1;
-
-        let node = roots.get(mid).expect("range");
-        if node.range.overlaps(range, collator) == Overlap::Greater {
-            end = mid;
-        } else {
-            start = mid + 1;
-        }
-    }
-
-    end
 }
