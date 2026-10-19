@@ -39,6 +39,19 @@ until finalization. Explicit registration remains available.
 resource's decision succeeds. The caller first finishes the affected operations
 and releases their permits; the semaphore does not enforce lifecycle quiescence.
 
+Within each transaction, the semaphore retains one exact reservation per equal
+range until finalization. Active overlap checks scan these reservations under the
+same mutex as registration and acquire one native permit. This avoids cloned
+range topology and permits disjoint operations to proceed independently. Work is
+linear in the transaction's retained range history; no range index or waiter queue
+is maintained. Async callers retry on notification without FIFO ordering or a
+starvation-freedom guarantee. Callers retain their existing request deadlines.
+
+A blocked same-transaction attempt retains its historical reservation even if
+cancelled. An attempt waiting on an earlier transaction, or rejected by conflicting
+future history, creates no reservation. Dropping active permits frees capacity
+before waking waiters; it does not erase transaction history.
+
 With sibling path dependencies available, run standalone checks from this directory:
 
 ```sh
