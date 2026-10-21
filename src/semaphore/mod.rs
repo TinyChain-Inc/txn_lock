@@ -272,6 +272,8 @@ where
                 }
             }
 
+            #[cfg(test)]
+            tests::before_wait();
             notified.await;
         }
     }

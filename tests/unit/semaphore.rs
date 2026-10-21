@@ -1,12 +1,14 @@
+use std::cell::RefCell;
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::Duration;
 
-use collate::Collator;
+use collate::{Collator, OverlapsRange};
 use futures::FutureExt;
 
 use super::{Error, Semaphore};
+use crate::set::Range as SetRange;
 
 type Lock = Semaphore<u64, Collator<usize>, Range<usize>>;
 
@@ -272,4 +274,330 @@ async fn acquisition_supports_non_clone_inputs_and_send_futures() {
         .unwrap()
         .unwrap();
     assert_eq!(permit.0, 2..4);
+}
+
+// Test-only injection at the acquisition-to-wait boundary.
+tokio::task_local! {
+    static BEFORE_WAIT: RefCell<Option<Box<dyn FnOnce()>>>;
+}
+
+pub(super) fn before_wait() {
+    let _ = BEFORE_WAIT.try_with(|hook| {
+        if let Some(hook) = hook.take() {
+            hook();
+        }
+    });
+}
+
+#[test]
+fn initial_reservation_blocks_overlapping_later_access() {
+    let semaphore = Semaphore::<u64, Collator<u64>, std::ops::Range<u64>>::with_reservation(
+        1,
+        Collator::default(),
+        2..4,
+    );
+    assert!(matches!(
+        semaphore.try_read(2, 3..4),
+        Err(Error::WouldBlock)
+    ));
+    assert!(matches!(
+        semaphore.try_write(2, 3..4),
+        Err(Error::WouldBlock)
+    ));
+    assert!(semaphore.try_read(2, 4..5).is_ok());
+    assert!(semaphore.try_write(2, 5..6).is_ok());
+    semaphore.finalize(&1, false);
+    assert!(semaphore.try_read(2, 3..4).is_ok());
+    assert!(semaphore.try_write(2, 3..4).is_ok());
+}
+
+#[tokio::test]
+async fn finalization_between_reservation_check_and_wait_is_observed() {
+    for write in [false, true] {
+        let semaphore = Semaphore::<u64, Collator<u64>, SetRange<u64>>::new(Collator::default());
+        drop(semaphore.try_write(1, SetRange::All).unwrap());
+        let blocker = semaphore.clone();
+        BEFORE_WAIT
+            .scope(
+                RefCell::new(Some(Box::new(move || blocker.finalize(&1, false)))),
+                async {
+                    let waiting = async {
+                        if write {
+                            drop(semaphore.write(2, SetRange::All).await.unwrap());
+                        } else {
+                            drop(semaphore.read(2, SetRange::All).await.unwrap());
+                        }
+                    };
+                    futures::pin_mut!(waiting);
+                    assert!(futures::poll!(waiting).is_ready());
+                    assert!(BEFORE_WAIT.with(|hook| hook.borrow().is_none()));
+                },
+            )
+            .await;
+    }
+}
+
+#[tokio::test]
+async fn cancelled_waiters_leave_no_later_reservation() {
+    for write in [false, true] {
+        let semaphore = Semaphore::<u64, Collator<u64>, SetRange<u64>>::new(Collator::default());
+        drop(semaphore.try_write(1, SetRange::All).unwrap());
+        {
+            let waiting = async {
+                if write {
+                    drop(semaphore.write(2, SetRange::All).await.unwrap());
+                } else {
+                    drop(semaphore.read(2, SetRange::All).await.unwrap());
+                }
+            };
+            futures::pin_mut!(waiting);
+            assert!(futures::poll!(waiting).is_pending());
+        }
+        assert_eq!(semaphore.versions.lock().unwrap().len(), 1);
+        semaphore.finalize(&1, false);
+        assert!(semaphore.versions.lock().unwrap().is_empty());
+        assert!(semaphore.try_write(3, SetRange::All).is_ok());
+    }
+}
+
+#[tokio::test]
+async fn covering_read_blocks_a_later_inserted_child_write() {
+    let semaphore = Semaphore::<u64, Collator<u64>, SetRange<u64>>::new(Collator::default());
+    let read = semaphore.try_read(1, SetRange::All).unwrap();
+    assert!(matches!(
+        semaphore.try_write(1, SetRange::One(Arc::new(2))),
+        Err(Error::WouldBlock)
+    ));
+    assert!(tokio::time::timeout(
+        std::time::Duration::from_millis(10),
+        semaphore.write(1, SetRange::One(Arc::new(2)))
+    )
+    .await
+    .is_err());
+    drop(read);
+    let write = semaphore.try_write(1, SetRange::One(Arc::new(2))).unwrap();
+    assert!(matches!(
+        semaphore.try_read(1, SetRange::All),
+        Err(Error::WouldBlock)
+    ));
+    drop(write);
+    assert!(semaphore.try_read(1, SetRange::All).is_ok());
+}
+
+#[test]
+fn exact_ranges_preserve_overlap_exclusion_and_disjoint_independence() {
+    let cases = [
+        (4..8, 4..8, true),
+        (0..20, 5..10, true),
+        (5..10, 0..20, true),
+        (0..10, 5..15, true),
+        (5..15, 0..10, true),
+        (0..5, 5..10, false),
+        (10..20, 70..80, false),
+        (70..80, 10..20, false),
+    ];
+    for (first, second, overlaps) in cases {
+        for first_write in [false, true] {
+            for second_write in [false, true] {
+                let semaphore =
+                    Semaphore::<u64, Collator<u64>, std::ops::Range<u64>>::new(Collator::default());
+                // Historical covering and intermediate ranges must not make
+                // disjoint live operations conflict with each other.
+                for history in [0..100, 40..60, 20..80] {
+                    drop(semaphore.try_read(1, history).unwrap());
+                }
+                let held: Box<dyn std::fmt::Debug> = if first_write {
+                    Box::new(semaphore.try_write(1, first.clone()).unwrap())
+                } else {
+                    Box::new(semaphore.try_read(1, first.clone()).unwrap())
+                };
+                let result = if second_write {
+                    semaphore.try_write(1, second.clone()).map(drop)
+                } else {
+                    semaphore.try_read(1, second.clone()).map(drop)
+                };
+                assert_eq!(
+                    result,
+                    if overlaps && (first_write || second_write) {
+                        Err(Error::WouldBlock)
+                    } else {
+                        Ok(())
+                    },
+                    "{first:?} write={first_write}, {second:?} write={second_write}"
+                );
+                drop(held);
+                assert!(semaphore.try_write(1, second.clone()).is_ok());
+            }
+        }
+    }
+}
+
+#[test]
+fn ordering_checks_exact_history_including_partial_tails() {
+    let semaphore = Semaphore::<u64, Collator<u64>, std::ops::Range<u64>>::new(Collator::default());
+    drop(semaphore.try_read(1, 0..100).unwrap());
+    drop(semaphore.try_write(1, 10..20).unwrap());
+    assert!(semaphore.try_read(2, 70..80).is_ok());
+    assert!(matches!(
+        semaphore.try_read(2, 15..16),
+        Err(Error::WouldBlock)
+    ));
+    semaphore.finalize(&1, false);
+    assert!(semaphore.try_read(2, 15..16).is_ok());
+
+    let semaphore = Semaphore::<u64, Collator<u64>, std::ops::Range<u64>>::new(Collator::default());
+    for range in [0..5, 10..15, 3..12] {
+        drop(semaphore.try_read(3, range).unwrap());
+    }
+    for tail in [0..1, 14..15] {
+        assert!(matches!(semaphore.try_write(2, tail), Err(Error::Conflict)));
+        assert!(!semaphore.versions.lock().unwrap().contains_key(&2));
+    }
+    assert!(semaphore.try_write(2, 15..16).is_ok());
+}
+
+#[tokio::test]
+async fn blocked_same_transaction_attempts_retain_history_without_active_permits() {
+    for asynchronous in [false, true] {
+        let semaphore =
+            Semaphore::<u64, Collator<u64>, std::ops::Range<u64>>::new(Collator::default());
+        let read = semaphore.try_read(1, 0..5).unwrap();
+        if asynchronous {
+            let waiting = semaphore.write(1, 0..20);
+            futures::pin_mut!(waiting);
+            assert!(futures::poll!(waiting).is_pending());
+            // Dropping the future cancels waiting, not its range history.
+        } else {
+            assert!(matches!(
+                semaphore.try_write(1, 0..20),
+                Err(Error::WouldBlock)
+            ));
+        }
+        drop(read);
+        assert!(matches!(
+            semaphore.try_read(2, 10..15),
+            Err(Error::WouldBlock)
+        ));
+        assert!(semaphore.try_write(1, 10..15).is_ok());
+        semaphore.finalize(&1, false);
+        assert!(semaphore.try_read(2, 10..15).is_ok());
+    }
+}
+
+#[tokio::test]
+async fn permit_release_between_attempt_and_wait_is_observed() {
+    for write in [false, true] {
+        let semaphore = Semaphore::<u64, Collator<u64>, SetRange<u64>>::new(Collator::default());
+        let held = semaphore.try_write(1, SetRange::All).unwrap();
+        BEFORE_WAIT
+            .scope(RefCell::new(Some(Box::new(move || drop(held)))), async {
+                let waiting = async {
+                    if write {
+                        drop(semaphore.write(1, SetRange::All).await.unwrap());
+                    } else {
+                        drop(semaphore.read(1, SetRange::All).await.unwrap());
+                    }
+                };
+                futures::pin_mut!(waiting);
+                assert!(futures::poll!(waiting).is_ready());
+                assert!(BEFORE_WAIT.with(|hook| hook.borrow().is_none()));
+            })
+            .await;
+    }
+}
+
+#[tokio::test]
+async fn notification_observes_released_permits_and_unlocked_history() {
+    use futures::task::{waker, ArcWake};
+    use std::future::Future;
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+    use std::task::Context;
+
+    struct Observer {
+        semaphore: Semaphore<u64, Collator<u64>, SetRange<u64>>,
+        txn_id: u64,
+        ready: AtomicBool,
+    }
+    impl ArcWake for Observer {
+        fn wake_by_ref(this: &Arc<Self>) {
+            // A custom waker may run immediately inside notify_waiters.
+            // Never hang the regression if it observes the old lock order.
+            let unlocked = this.semaphore.versions.try_lock().is_ok();
+            let ready = unlocked && this.semaphore.try_write(this.txn_id, SetRange::All).is_ok();
+            this.ready.store(ready, AtomicOrdering::SeqCst);
+        }
+    }
+
+    for finalize in [false, true] {
+        let semaphore = Semaphore::<u64, Collator<u64>, SetRange<u64>>::new(Collator::default());
+        let held = semaphore.try_write(1, SetRange::All).unwrap();
+        let txn_id = if finalize { 2 } else { 1 };
+        let observer = Arc::new(Observer {
+            semaphore: semaphore.clone(),
+            txn_id,
+            ready: AtomicBool::new(false),
+        });
+        let wake = waker(observer.clone());
+        let mut context = Context::from_waker(&wake);
+        let waiting = semaphore.read(txn_id, SetRange::All);
+        futures::pin_mut!(waiting);
+        assert!(waiting.as_mut().poll(&mut context).is_pending());
+        if finalize {
+            drop(held);
+            // Re-poll after permit release: history still blocks txn 2.
+            assert!(waiting.as_mut().poll(&mut context).is_pending());
+            observer.ready.store(false, AtomicOrdering::SeqCst);
+            semaphore.finalize(&1, false);
+        } else {
+            drop(held);
+        }
+        assert!(observer.ready.load(AtomicOrdering::SeqCst));
+        assert!(waiting.as_mut().poll(&mut context).is_ready());
+    }
+}
+
+#[tokio::test]
+async fn acquisition_requires_no_clone_bound_on_ids_or_ranges() {
+    #[derive(Debug, Eq, PartialEq, Ord, PartialOrd)]
+    struct Id(u64);
+    #[derive(Debug)]
+    struct Selection(std::ops::Range<u64>);
+    impl OverlapsRange<Self, Collator<u64>> for Selection {
+        fn overlaps(&self, other: &Self, collator: &Collator<u64>) -> collate::Overlap {
+            self.0.overlaps(&other.0, collator)
+        }
+    }
+
+    let semaphore = Semaphore::<Id, Collator<u64>, Selection>::new(Collator::default());
+    let read = semaphore.try_read(Id(1), Selection(2..4)).unwrap();
+    let waiting = semaphore.write(Id(1), Selection(2..4));
+    futures::pin_mut!(waiting);
+    assert!(futures::poll!(waiting.as_mut()).is_pending());
+    drop(read);
+    let write = waiting.await.unwrap();
+    assert_eq!(write.0, 2..4);
+}
+
+#[test]
+fn equal_ranges_share_one_reservation_and_preserve_write_history() {
+    let semaphore = Semaphore::<u64, Collator<u64>, Range<u64>>::new(Collator::default());
+    let read = semaphore.try_read(1, 2..4).unwrap();
+    for _ in 0..64 {
+        drop(semaphore.try_read(1, 2..4).unwrap());
+        assert!(matches!(
+            semaphore.try_write(1, 2..4),
+            Err(Error::WouldBlock)
+        ));
+    }
+    {
+        let versions = semaphore.versions.lock().unwrap();
+        assert_eq!(versions[&1].len(), 1);
+        assert!(versions[&1][0].write);
+    }
+    drop(read);
+    drop(semaphore.try_write(1, 2..4).unwrap());
+    assert!(matches!(
+        semaphore.try_read(2, 2..4),
+        Err(Error::WouldBlock)
+    ));
 }
