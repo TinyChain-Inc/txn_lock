@@ -41,10 +41,10 @@ and releases their permits; the semaphore does not enforce lifecycle quiescence.
 
 Within each transaction, the semaphore retains one exact reservation per equal
 range until finalization. Active overlap checks scan these reservations under the
-same mutex as registration and acquire one native permit. This avoids cloned
-range topology and permits disjoint operations to proceed independently. Work is
-linear in the transaction's retained range history; no range index or waiter queue
-is maintained. Async callers retry on notification without FIFO ordering or a
+same mutex as registration and acquire one native permit. The mutex never spans
+caller I/O. This avoids cloned range topology and permits disjoint operations
+to proceed independently. Work is linear in the transaction's retained range
+history; no range index or waiter queue is maintained. Async callers retry on notification without FIFO ordering or a
 starvation-freedom guarantee. Callers retain their existing request deadlines.
 
 A blocked same-transaction attempt retains its historical reservation even if
