@@ -58,79 +58,95 @@
 //!
 //! [`tokio::sync::Semaphore`]: https://docs.rs/tokio/latest/tokio/sync/struct.Semaphore.html
 
-mod version;
-
 use std::cmp::Ordering;
-use std::collections::{btree_map, BTreeMap};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::ops::Deref;
 use std::sync::{Arc, Mutex};
 
-use collate::{Collate, OverlapsRange};
-use tokio::sync::Notify;
+use collate::{Collate, Overlap, OverlapsRange};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore as NativeSemaphore};
 
 use super::{Error, Result};
 
-use version::{Permit as VersionPermit, RangeLock, Version};
+const PERMITS: u32 = u32::MAX >> 3;
 
-/// A permit to read a specific section of a transactional resource
+struct Reservation<R> {
+    range: Arc<R>,
+    write: bool,
+    semaphore: Arc<NativeSemaphore>,
+}
+
+impl<R> Reservation<R> {
+    fn new(range: Arc<R>, write: bool) -> Self {
+        Self {
+            range,
+            write,
+            semaphore: Arc::new(NativeSemaphore::new(PERMITS as usize)),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Permit<R> {
+    range: Arc<R>,
+    owned: Option<OwnedSemaphorePermit>,
+    notify: Arc<Notify>,
+}
+
+impl<R> Drop for Permit<R> {
+    fn drop(&mut self) {
+        // A woken task must observe the released capacity, even on another thread.
+        drop(self.owned.take());
+        self.notify.notify_waiters();
+    }
+}
+
+/// A permit to read a specific section of a transactional resource.
 #[derive(Debug)]
 pub struct PermitRead<R> {
-    permit: VersionPermit<R>,
-    notify: Arc<Notify>,
+    permit: Permit<R>,
 }
 
 impl<R> Deref for PermitRead<R> {
     type Target = R;
 
     fn deref(&self) -> &Self::Target {
-        self.permit.deref()
+        &self.permit.range
     }
 }
 
-impl<R> Drop for PermitRead<R> {
-    fn drop(&mut self) {
-        self.notify.notify_waiters()
-    }
-}
-
-/// A permit to write to a specific section of a transactional resource
+/// A permit to write to a specific section of a transactional resource.
 #[derive(Debug)]
 pub struct PermitWrite<R> {
-    permit: VersionPermit<R>,
-    notify: Arc<Notify>,
+    permit: Permit<R>,
 }
 
 impl<R> Deref for PermitWrite<R> {
     type Target = R;
 
     fn deref(&self) -> &Self::Target {
-        self.permit.deref()
+        &self.permit.range
     }
 }
 
-impl<R> Drop for PermitWrite<R> {
-    fn drop(&mut self) {
-        self.notify.notify_waiters()
-    }
+enum Attempt<I, R> {
+    Acquired(Permit<R>),
+    Pending(I, Arc<R>),
 }
 
-enum VersionRead<I, C, R> {
-    Version(Arc<R>, RangeLock<C, R>),
-    Pending(Arc<R>, I),
-}
-
-/// A semaphore used to maintain the ACID compliance of transactional resource
+/// A semaphore maintaining transactional ordering and overlapping-range exclusion.
+///
+/// Acquisition scans exact reservations under one short-lived mutex; permits never
+/// hold that mutex during caller work. Async retries are non-FIFO and may barge:
+/// starvation freedom is not guaranteed.
 pub struct Semaphore<I, C, R> {
     collator: C,
-    versions: Arc<Mutex<BTreeMap<I, Version<C, R>>>>,
+    versions: Arc<Mutex<BTreeMap<I, Vec<Reservation<R>>>>>,
     notify: Arc<Notify>,
 }
 
-impl<I, C, R> Clone for Semaphore<I, C, R>
-where
-    C: Clone,
-{
+impl<I, C: Clone, R> Clone for Semaphore<I, C, R> {
     fn clone(&self) -> Self {
         Self {
             collator: self.collator.clone(),
@@ -157,259 +173,170 @@ where
     C: Collate + Clone + Send + Sync,
     R: OverlapsRange<R, C> + fmt::Debug + Send + Sync,
 {
-    /// Construct a new transactional [`Semaphore`] with a write reservation for its initial value.
+    /// Construct a semaphore with a historical write reservation for its initial value.
     pub fn with_reservation(txn_id: I, collator: C, range: R) -> Self {
-        let mut version = Version::new(collator.clone());
-        version.insert(Arc::new(range), true);
-
-        let mut versions: BTreeMap<I, Version<C, R>> = BTreeMap::new();
-        versions.insert(txn_id, version);
-
+        let versions = BTreeMap::from([(txn_id, vec![Reservation::new(Arc::new(range), true)])]);
         Self {
             collator,
-            versions: Arc::new(Mutex::new(BTreeMap::new())),
+            versions: Arc::new(Mutex::new(versions)),
             notify: Arc::new(Notify::new()),
         }
     }
 
-    fn read_inner(&self, txn_id: I, range: Arc<R>) -> VersionRead<I, C, R> {
-        #[cfg(feature = "logging")]
-        log::trace!("Semaphore::read_inner {range:?}");
-
+    fn attempt(&self, txn_id: I, range: Arc<R>, write: bool) -> Result<Attempt<I, R>> {
         let mut versions = self.versions.lock().expect("versions");
 
-        // check if there's an overlapping write lock in the past
-        for (version_id, version) in versions.iter_mut() {
-            match txn_id.cmp(version_id) {
+        // Historical rejection must not register an attempted reservation.
+        for (id, reservations) in versions.iter() {
+            match txn_id.cmp(id) {
                 Ordering::Greater => {
-                    if version.is_pending_write_at(range.as_ref()) {
-                        #[cfg(feature = "logging")]
-                        log::trace!("{range:?} is reserved for writing at {version_id:?}");
-
-                        // if there's a write lock in the past, wait it out
-                        return VersionRead::Pending(range, txn_id);
+                    if reservations
+                        .iter()
+                        .any(|r| r.write && r.range.contains_partial(&range, &self.collator))
+                    {
+                        return Ok(Attempt::Pending(txn_id, range));
                     }
                 }
-                Ordering::Equal => {
-                    #[cfg(feature = "logging")]
-                    log::trace!("this semaphore already has a record for {range:?}");
-
-                    let root = version.insert(range.clone(), false);
-                    return VersionRead::Version(range, root);
+                Ordering::Less
+                    if write
+                        && reservations
+                            .iter()
+                            .any(|r| r.range.contains_partial(&range, &self.collator)) =>
+                {
+                    return Err(Error::Conflict);
                 }
-                Ordering::Less => break,
+                _ => {}
             }
         }
 
-        #[cfg(feature = "logging")]
-        log::trace!("creating a new record for {range:?}...");
+        let count = if write { PERMITS } else { 1 };
+        let owned = if let Some(reservations) = versions.get_mut(&txn_id) {
+            let position = if let Some(position) = reservations
+                .iter()
+                .position(|r| r.range.overlaps(&range, &self.collator) == Overlap::Equal)
+            {
+                reservations[position].write |= write;
+                position
+            } else {
+                reservations.push(Reservation::new(range.clone(), write));
+                reservations.len() - 1
+            };
 
-        let mut version = Version::new(self.collator.clone());
-        let root = version.insert(range.clone(), false);
-        versions.insert(txn_id, version);
+            // An active permit protects its exact range, including reservations
+            // added after it was acquired. Topology plays no role in exclusion.
+            if reservations.iter().any(|r| {
+                let available = r.semaphore.available_permits();
+                r.range.contains_partial(&range, &self.collator)
+                    && if write {
+                        available < PERMITS as usize
+                    } else {
+                        available == 0
+                    }
+            }) {
+                return Ok(Attempt::Pending(txn_id, range));
+            }
 
-        VersionRead::Version(range, root)
+            reservations[position]
+                .semaphore
+                .clone()
+                .try_acquire_many_owned(count)?
+        } else {
+            let reservation = Reservation::new(range.clone(), write);
+            let owned = reservation
+                .semaphore
+                .clone()
+                .try_acquire_many_owned(count)?;
+            versions.insert(txn_id, vec![reservation]);
+            owned
+        };
+
+        Ok(Attempt::Acquired(Permit {
+            range,
+            owned: Some(owned),
+            notify: self.notify.clone(),
+        }))
+    }
+
+    async fn acquire(&self, mut txn_id: I, range: R, write: bool) -> Result<Permit<R>> {
+        let mut range = Arc::new(range);
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            match self.attempt(txn_id, range, write)? {
+                Attempt::Acquired(permit) => return Ok(permit),
+                Attempt::Pending(id, requested) => {
+                    txn_id = id;
+                    range = requested;
+                }
+            }
+
+            notified.await;
+        }
+    }
+
+    fn try_acquire(&self, txn_id: I, range: R, write: bool) -> Result<Permit<R>> {
+        match self.attempt(txn_id, Arc::new(range), write)? {
+            Attempt::Acquired(permit) => Ok(permit),
+            Attempt::Pending(_, _) => Err(Error::WouldBlock),
+        }
     }
 
     /// Acquire a permit to read a section of a transactional resource.
-    pub async fn read(&self, mut txn_id: I, range: R) -> Result<PermitRead<R>> {
-        let mut range = Arc::new(range);
-
-        loop {
-            match self.read_inner(txn_id, range) {
-                VersionRead::Pending(r, id) => {
-                    txn_id = id;
-                    range = r;
-                }
-                VersionRead::Version(range, root) => {
-                    #[cfg(feature = "logging")]
-                    log::trace!("acquiring a read permit on {range:?}...");
-
-                    let permit = root.read(&range, &self.collator).await?;
-
-                    #[cfg(feature = "logging")]
-                    log::trace!("acquired read permit on {range:?}");
-
-                    return Ok(PermitRead {
-                        permit,
-                        notify: self.notify.clone(),
-                    });
-                }
-            }
-
-            self.notify.notified().await;
-        }
+    pub async fn read(&self, txn_id: I, range: R) -> Result<PermitRead<R>> {
+        self.acquire(txn_id, range, false)
+            .await
+            .map(|permit| PermitRead { permit })
     }
 
-    /// Synchronously acquire a permit to read a section of transactional resource, if possible.
+    /// Synchronously acquire a read permit, if possible.
     pub fn try_read(&self, txn_id: I, range: R) -> Result<PermitRead<R>> {
-        let range = Arc::new(range);
-
-        match self.read_inner(txn_id, range) {
-            VersionRead::Pending(_, _) => Err(Error::WouldBlock),
-            VersionRead::Version(range, root) => {
-                root.try_read(&range, &self.collator)
-                    .map(|permit| PermitRead {
-                        permit,
-                        notify: self.notify.clone(),
-                    })
-            }
-        }
+        self.try_acquire(txn_id, range, false)
+            .map(|permit| PermitRead { permit })
     }
 
-    fn write_inner(&self, txn_id: I, range: Arc<R>) -> Result<VersionRead<I, C, R>> {
-        #[cfg(feature = "logging")]
-        log::trace!(
-            "lock semaphore state to check if {:?} is available for writing...",
-            range
-        );
-
-        let mut versions = self.versions.lock().expect("versions");
-
-        #[cfg(feature = "logging")]
-        log::trace!("locked semaphore state, checking if {range:?} is available for writing...");
-
-        // handle creating a new version
-        for (version_id, version) in versions.iter() {
-            match txn_id.cmp(version_id) {
-                Ordering::Greater => {
-                    if version.is_pending_write_at(range.as_ref()) {
-                        // if there's a write lock in the past, wait it out
-                        #[cfg(feature = "logging")]
-                        log::trace!("there is a pending write overlapping {:?}", range);
-
-                        return Ok(VersionRead::Pending(range, txn_id));
-                    }
-                }
-                Ordering::Equal => {
-                    // this case is handled below
-                }
-                Ordering::Less => {
-                    if version.has_been_read_at(range.as_ref()) {
-                        // can't allow writes to this range, there's already a future version
-                        return Err(Error::Conflict);
-                    }
-                }
-            }
-        }
-
-        #[cfg(feature = "logging")]
-        log::trace!(
-            "checking if this semaphore already has a record for {:?}...",
-            range
-        );
-
-        match versions.entry(txn_id) {
-            btree_map::Entry::Occupied(mut entry) => {
-                #[cfg(feature = "logging")]
-                log::trace!("this semaphore already has a record for {:?}", range);
-
-                let version = entry.get_mut();
-                let root = version.insert(range.clone(), true);
-
-                #[cfg(feature = "logging")]
-                log::trace!("got the RangeLock for {:?}", range);
-
-                Ok(VersionRead::Version(range, root))
-            }
-            btree_map::Entry::Vacant(entry) => {
-                #[cfg(feature = "logging")]
-                log::trace!("creating a new record for {:?}...", range);
-
-                let mut version = Version::new(self.collator.clone());
-                let root = version.insert(range.clone(), true);
-                entry.insert(version);
-
-                #[cfg(feature = "logging")]
-                log::trace!("created a new RangeLock for {:?}", range);
-
-                Ok(VersionRead::Version(range, root))
-            }
-        }
+    /// Acquire a permit to write to a section of a transactional resource.
+    pub async fn write(&self, txn_id: I, range: R) -> Result<PermitWrite<R>> {
+        self.acquire(txn_id, range, true)
+            .await
+            .map(|permit| PermitWrite { permit })
     }
 
-    /// Acquire a permit to write to a section of transactional resource, if possible.
-    pub async fn write(&self, mut txn_id: I, range: R) -> Result<PermitWrite<R>> {
-        #[cfg(feature = "logging")]
-        log::debug!("Semaphore::write {:?}", range);
-
-        let mut range = Arc::new(range);
-
-        loop {
-            match self.write_inner(txn_id, range)? {
-                VersionRead::Pending(r, id) => {
-                    txn_id = id;
-                    range = r;
-                }
-                VersionRead::Version(range, root) => {
-                    #[cfg(feature = "logging")]
-                    log::trace!("acquiring a write permit on {range:?}...");
-
-                    let permit = root.write(&range, &self.collator).await?;
-
-                    #[cfg(feature = "logging")]
-                    log::trace!("acquired write permit on {range:?}");
-
-                    return Ok(PermitWrite {
-                        permit,
-                        notify: self.notify.clone(),
-                    });
-                }
-            }
-
-            self.notify.notified().await;
-        }
-    }
-
-    /// Synchronously acquire a permit to write to a section of transactional resource, if possible.
+    /// Synchronously acquire a write permit, if possible.
     pub fn try_write(&self, txn_id: I, range: R) -> Result<PermitWrite<R>> {
-        let range = Arc::new(range);
-
-        match self.write_inner(txn_id, range)? {
-            VersionRead::Pending(_, _) => Err(Error::WouldBlock),
-            VersionRead::Version(range, root) => {
-                root.try_write(&range, &self.collator)
-                    .map(|permit| PermitWrite {
-                        permit,
-                        notify: self.notify.clone(),
-                    })
-            }
-        }
+        self.try_acquire(txn_id, range, true)
+            .map(|permit| PermitWrite { permit })
     }
 }
 
 impl<I: Copy + Ord + fmt::Debug, C, R> Semaphore<I, C, R> {
-    /// Mark a transaction completed, un-blocking waiting requests for future permits.
+    /// Release reservations after the caller has quiesced the affected operations.
     ///
-    /// Call this when the transactional resource is no longer writable at `txn_id`
-    /// (due to a commit, rollback, timeout, or any other reason).
-    ///
-    /// Set `drop_past` to `true` to finalize all transactions older than `txn_id`.
+    /// With `drop_past`, also remove all reservations earlier than `txn_id`.
+    /// The caller owns lifecycle decisions; this semaphore stores no finalized frontier.
     pub fn finalize(&self, txn_id: &I, drop_past: bool) {
         let mut versions = self.versions.lock().expect("versions");
-
         let notify = if drop_past {
-            let mut notify = false;
-
-            while let Some(version_id) = versions.keys().next().copied() {
-                if &version_id > txn_id {
-                    break;
-                } else {
-                    assert!(versions.remove(&version_id).is_some());
-                    notify = true;
-                }
+            let count = versions.len();
+            while versions
+                .first_key_value()
+                .is_some_and(|(id, _)| id <= txn_id)
+            {
+                versions.pop_first();
             }
-
-            notify
+            versions.len() != count
         } else {
             versions.remove(txn_id).is_some()
         };
+        drop(versions);
 
         if notify {
-            #[cfg(feature = "logging")]
-            log::trace!("dropped transactional semaphore version {txn_id:?}");
-
             self.notify.notify_waiters();
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/unit/semaphore.rs"]
+mod tests;

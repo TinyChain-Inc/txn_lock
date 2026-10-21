@@ -39,6 +39,11 @@ until finalization. Explicit registration remains available.
 resource's decision succeeds. The caller first finishes the affected operations
 and releases their permits; the semaphore does not enforce lifecycle quiescence.
 
+Range acquisition scans exact reservations under one mutex, independent of insertion
+order. Native permits own active access; historical reservations remain until finalization.
+The mutex never spans caller I/O. Async retries may barge and are not FIFO; no
+starvation-freedom guarantee is made.
+
 With sibling path dependencies available, run standalone checks from this directory:
 
 ```sh
