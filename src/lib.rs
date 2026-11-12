@@ -17,7 +17,7 @@ mod range;
 
 use std::fmt;
 
-/// An error which may occur when attempting to acquire a transactional lock
+/// An error during transactional access or a lifecycle decision
 #[derive(Clone, Eq, PartialEq)]
 pub enum Error {
     /// Cannot acquire a write lock because the transaction is already committed
@@ -90,3 +90,7 @@ impl From<tokio::sync::TryAcquireError> for Error {
 }
 
 type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+#[path = "../tests/unit/lifecycle.rs"]
+mod lifecycle_tests;

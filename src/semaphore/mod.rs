@@ -34,7 +34,7 @@
 //!
 //! // Finalizing a transaction will un-block permits for later transactions
 //! // It's the caller's responsibility to make sure that data can't be mutated after finalizing
-//! semaphore.finalize(&0, false);
+//! semaphore.finalize(&0, false).unwrap();
 //!
 //! // Now permits for later transactions are un-blocked
 //! let permit1 = semaphore.try_read(1, 1..2).expect("permit");
@@ -44,7 +44,7 @@
 //! assert_eq!(semaphore.try_read(3, 1..4).unwrap_err(), Error::WouldBlock);
 //!
 //! // To prevent a memory leak, finalize all transactions earlier than the given ID
-//! semaphore.finalize(&2, true);
+//! semaphore.finalize(&2, true).unwrap();
 //!
 //! // Now later permits are un-blocked
 //! let permit3 = semaphore.try_write(3, 1..4).expect("permit");
@@ -184,7 +184,10 @@ where
     }
 
     fn attempt(&self, txn_id: I, range: Arc<R>, write: bool) -> Result<Attempt<I, R>> {
-        let mut versions = self.versions.lock().expect("versions");
+        let mut versions = self
+            .versions
+            .lock()
+            .expect("transaction bookkeeping poisoned");
 
         // Historical rejection must not register an attempted reservation.
         for (id, reservations) in versions.iter() {
@@ -246,6 +249,7 @@ where
                 .semaphore
                 .clone()
                 .try_acquire_many_owned(count)?;
+
             versions.insert(txn_id, vec![reservation]);
             owned
         };
@@ -274,6 +278,7 @@ where
 
             #[cfg(test)]
             tests::before_wait();
+
             notified.await;
         }
     }
@@ -317,8 +322,12 @@ impl<I: Copy + Ord + fmt::Debug, C, R> Semaphore<I, C, R> {
     ///
     /// With `drop_past`, also remove all reservations earlier than `txn_id`.
     /// The caller owns lifecycle decisions; this semaphore stores no finalized frontier.
-    pub fn finalize(&self, txn_id: &I, drop_past: bool) {
-        let mut versions = self.versions.lock().expect("versions");
+    pub fn finalize(&self, txn_id: &I, drop_past: bool) -> Result<()> {
+        let mut versions = self
+            .versions
+            .lock()
+            .expect("transaction bookkeeping poisoned");
+
         let notify = if drop_past {
             let count = versions.len();
             while versions
@@ -327,15 +336,19 @@ impl<I: Copy + Ord + fmt::Debug, C, R> Semaphore<I, C, R> {
             {
                 versions.pop_first();
             }
+
             versions.len() != count
         } else {
             versions.remove(txn_id).is_some()
         };
+
         drop(versions);
 
         if notify {
             self.notify.notify_waiters();
         }
+
+        Ok(())
     }
 }
 

@@ -6,7 +6,7 @@ edition = "2021"
 description = "Utilities to support transactional versioning"
 license = "Apache-2.0"
 readme = "README.md"
-repository = "https://github.com/haydnv/tinychain.git"
+repository = "https://github.com/TinyChain-Inc/tinychain.git"
 
 keywords = ["transaction", "transactional", "lock", "version", "versioning"]
 categories = ["concurrency", "data-structures"]
@@ -18,7 +18,6 @@ logging = ["log"]
 
 [dependencies]
 collate = { path = "../collate", version = "0.4" }
-ds-ext = { path = "../ds-ext", version = "0.4" }
 hr-id = { path = "../hr-id", version = "0.7", optional = true }
 futures = "0.3"
 log = { version = "0.4", features = ["release_max_level_info"], optional = true }
