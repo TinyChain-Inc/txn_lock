@@ -24,7 +24,7 @@
 //!
 //! std::mem::drop(value);
 //!
-//! let (state_at_txn_1, deltas) = block_on(map.read_and_commit(1));
+//! let (state_at_txn_1, deltas) = block_on(map.read_and_commit(1)).unwrap();
 //! assert_eq!(deltas.expect("deltas").len(), 1);
 //! assert_eq!(state_at_txn_1.len(), 1);
 //!
@@ -44,21 +44,21 @@
 //!
 //! assert_eq!(map.try_insert(2, two.to_string(), 2.0).expect("insert"), Some(1.0.into()));
 //!
-//! map.rollback(&2);
+//! map.rollback(&2).unwrap();
 //!
 //! let value = map.try_get(1, one).expect("read");
 //! assert_eq!(*(value.expect("guard")), 1.0);
 //!
 //! assert!(map.try_remove(3, two).expect("remove").is_none());
 //!
-//! map.finalize(2);
+//! map.finalize(2).unwrap();
 //!
 //! assert_eq!(map.try_get(1, one).unwrap_err(), Error::Outdated);
 //!
 //! let value = map.try_get(3, one).expect("read");
 //! assert_eq!(*(value.expect("guard")), 1.0);
 //!
-//! map.commit(3);
+//! map.commit(3).unwrap();
 //!
 //! let extension = [
 //!     ("one".to_string(), 1.0),
@@ -97,7 +97,7 @@
 use std::borrow::Borrow;
 use std::cmp::Ordering;
 use std::collections::hash_map::{self, HashMap};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::hash::Hash;
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, RwLock as RwLockInner};
@@ -105,19 +105,18 @@ use std::task::Poll;
 use std::{fmt, iter};
 
 use collate::Collator;
-use ds_ext::{OrdHashMap, OrdHashSet};
 use futures::TryFutureExt;
 use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 
 use super::guard::{TxnReadGuard, TxnReadGuardMap, TxnWriteGuard};
+pub use super::range::{Key, Range};
 use super::semaphore::*;
 use super::{Error, Result};
 
-pub use super::range::{Key, Range};
-
 type Canon<K, V> = HashMap<Key<K>, Arc<V>>;
+type CommitResult<K, V> = Result<(Canon<K, V>, Option<Delta<K, V>>)>;
 type Delta<K, V> = HashMap<Key<K>, Option<Arc<V>>>;
-type Deltas<I, K, V> = OrdHashMap<I, Delta<K, V>>;
+type Deltas<I, K, V> = BTreeMap<I, Delta<K, V>>;
 type Pending<K, V> = HashMap<Key<K>, Option<Arc<RwLock<V>>>>;
 
 /// A read guard on a value in a [`TxnMapLock`]
@@ -137,9 +136,9 @@ enum PendingValue<V> {
 
 struct State<I, K, V> {
     canon: Canon<K, V>,
-    commits: OrdHashSet<I>,
+    commits: BTreeSet<I>,
     deltas: Deltas<I, K, V>,
-    pending: OrdHashMap<I, Pending<K, V>>,
+    pending: BTreeMap<I, Pending<K, V>>,
     finalized: Option<I>,
 }
 
@@ -148,9 +147,9 @@ impl<I: Ord + Hash + fmt::Debug, K, V> State<I, K, V> {
     fn new(txn_id: I, version: Pending<K, V>) -> Self {
         Self {
             canon: Canon::new(),
-            commits: OrdHashSet::new(),
-            deltas: OrdHashMap::new(),
-            pending: OrdHashMap::from_iter(iter::once((txn_id, version))),
+            commits: BTreeSet::new(),
+            deltas: BTreeMap::new(),
+            pending: BTreeMap::from_iter(iter::once((txn_id, version))),
             finalized: None,
         }
     }
@@ -158,9 +157,9 @@ impl<I: Ord + Hash + fmt::Debug, K, V> State<I, K, V> {
     fn from_committed(canon: Canon<K, V>) -> Self {
         Self {
             canon,
-            commits: OrdHashSet::new(),
-            deltas: OrdHashMap::new(),
-            pending: OrdHashMap::new(),
+            commits: BTreeSet::new(),
+            deltas: BTreeMap::new(),
+            pending: BTreeMap::new(),
             finalized: None,
         }
     }
@@ -183,7 +182,7 @@ where
 
     #[inline]
     fn check_pending(&self, txn_id: &I) -> Result<()> {
-        if self.finalized.as_ref() > Some(txn_id) {
+        if self.finalized.as_ref() >= Some(txn_id) {
             Err(Error::Outdated)
         } else if self.commits.contains(txn_id) {
             Err(Error::Committed)
@@ -196,11 +195,7 @@ where
     fn canon(&self, txn_id: &I) -> Canon<K, V> {
         let mut canon = self.canon.clone();
 
-        let deltas = self
-            .deltas
-            .iter()
-            .take_while(|(id, _)| *id <= txn_id)
-            .map(|(_id, version)| version);
+        let deltas = self.deltas.range(..=txn_id).map(|(_id, version)| version);
 
         for version in deltas {
             for (key, delta) in version {
@@ -237,37 +232,72 @@ where
     }
 
     #[inline]
-    fn commit_version(&mut self, txn_id: &I) -> Option<Delta<K, V>> {
-        self.pending.remove(txn_id).map(|version| {
+    fn check_commit(&self, txn_id: &I) -> Result<()> {
+        if self.check_committed(txn_id)? {
+            Ok(())
+        } else {
+            self.check_pending_values(txn_id)
+        }
+    }
+
+    #[inline]
+    fn check_pending_values(&self, txn_id: &I) -> Result<()> {
+        if self.pending.get(txn_id).is_some_and(|version| {
+            version
+                .values()
+                .flatten()
+                .any(|value| Arc::strong_count(value) != 1)
+        }) {
+            return Err(Error::Busy);
+        }
+
+        Ok(())
+    }
+
+    #[inline]
+    fn commit_version(&mut self, txn_id: &I) -> Result<Option<Delta<K, V>>> {
+        self.check_pending_values(txn_id)?;
+
+        // Check the entire version before removing anything. The state lock
+        // prevents new references while these exclusively owned values move.
+        Ok(self.pending.remove(txn_id).map(|version| {
             version
                 .into_iter()
                 .map(|(key, delta)| {
-                    let value = if let Some(present) = delta {
-                        if let Ok(value) = Arc::try_unwrap(present) {
-                            Some(Arc::new(value.into_inner()))
-                        } else {
-                            panic!("a value at {:?} is still locked", txn_id);
-                        }
-                    } else {
-                        None
-                    };
+                    let value = delta.map(|value| {
+                        Arc::new(
+                            Arc::try_unwrap(value)
+                                .expect("exclusive pending value")
+                                .into_inner(),
+                        )
+                    });
 
                     (key, value)
                 })
                 .collect()
-        })
+        }))
     }
 
     #[inline]
-    fn commit(&mut self, txn_id: I) {
+    fn commit(&mut self, txn_id: I) -> Result<()> {
         if self.commits.contains(&txn_id) {
             #[cfg(feature = "logging")]
             log::warn!("duplicate commit at {:?}", txn_id);
-        } else if let Some(version) = self.commit_version(&txn_id) {
+        } else if let Some(version) = self.commit_version(&txn_id)? {
             self.deltas.insert(txn_id, version);
         }
 
         self.commits.insert(txn_id);
+        Ok(())
+    }
+
+    fn read_and_commit(&mut self, txn_id: I) -> CommitResult<K, V> {
+        if self.check_committed(&txn_id)? {
+            return Ok((self.canon(&txn_id), None));
+        }
+
+        self.commit(txn_id)?;
+        Ok((self.canon(&txn_id), self.deltas.get(&txn_id).cloned()))
     }
 
     #[inline]
@@ -336,29 +366,25 @@ where
             return None;
         }
 
-        while let Some(version_id) = self.pending.keys().next().copied() {
-            if version_id <= txn_id {
-                self.pending.pop_first();
-            } else {
+        while let Some(entry) = self.pending.first_entry() {
+            if entry.key() > &txn_id {
                 break;
             }
+
+            entry.remove_entry();
         }
 
-        while let Some(version_id) = self.commits.first().copied() {
-            if version_id <= txn_id {
-                self.commits.pop_first();
-            } else {
-                break;
-            }
+        while self.commits.first().is_some_and(|id| id <= &txn_id) {
+            self.commits.pop_first();
         }
 
-        while let Some(version_id) = self.deltas.keys().next().copied() {
-            if version_id <= txn_id {
-                let version = self.deltas.pop_first().expect("version");
-                merge_owned(&mut self.canon, version);
-            } else {
+        while let Some(entry) = self.deltas.first_entry() {
+            if entry.key() > &txn_id {
                 break;
             }
+
+            let (_, version) = entry.remove_entry();
+            merge_owned(&mut self.canon, version);
         }
 
         self.finalized = Some(txn_id);
@@ -469,11 +495,7 @@ where
     fn keys_committed(&self, txn_id: &I) -> HashSet<Key<K>> {
         let mut keys = self.canon.keys().cloned().collect();
 
-        let deltas = self
-            .deltas
-            .iter()
-            .take_while(|(id, _)| *id <= txn_id)
-            .map(|(_, version)| version);
+        let deltas = self.deltas.range(..=txn_id).map(|(_, version)| version);
 
         for version in deltas {
             merge_keys(&mut keys, version);
@@ -529,7 +551,7 @@ where
 #[inline]
 fn contains_canon<I, K, V, Q>(
     canon: &Canon<K, V>,
-    deltas: &OrdHashMap<I, Delta<K, V>>,
+    deltas: &BTreeMap<I, Delta<K, V>>,
     txn_id: &I,
     key: &Q,
 ) -> bool
@@ -539,11 +561,7 @@ where
     Q: Eq + Hash + ?Sized,
     Key<K>: Borrow<Q>,
 {
-    let deltas = deltas
-        .iter()
-        .rev()
-        .skip_while(|(id, _)| *id > txn_id)
-        .map(|(_, version)| version);
+    let deltas = deltas.range(..=txn_id).rev().map(|(_, version)| version);
 
     for delta in deltas {
         if let Some(key_state) = delta.get(key) {
@@ -607,7 +625,7 @@ where
         let guard = value.clone().try_write_owned().expect("value");
 
         if let Some(version) = self.pending.get_mut(&txn_id) {
-            assert!(version.insert(key, Some(value)).is_none());
+            assert!(version.insert(key, Some(value)).flatten().is_none());
         } else {
             let version = iter::once((key, Some(value))).collect();
             self.pending.insert(txn_id, version);
@@ -630,11 +648,7 @@ where
     Q: Eq + Hash + ?Sized,
     Key<K>: Borrow<Q>,
 {
-    let committed = deltas
-        .iter()
-        .rev()
-        .skip_while(|(id, _)| *id > txn_id)
-        .map(|(_, version)| version);
+    let committed = deltas.range(..=txn_id).rev().map(|(_, version)| version);
 
     for version in committed {
         if let Some(delta) = version.get(key) {
@@ -681,10 +695,10 @@ impl<K, V> EntryOccupied<K, V> {
 
 /// A vacant entry in a [`TxnMapLock`]
 pub struct EntryVacant<I, K, V> {
-    permit: PermitWrite<Range<K>>,
     txn_id: I,
     key: Key<K>,
     map_state: Arc<RwLockInner<State<I, K, V>>>,
+    permit: PermitWrite<Range<K>>,
 }
 
 impl<I, K, V> EntryVacant<I, K, V>
@@ -693,11 +707,41 @@ where
     K: Hash + Ord + Clone + fmt::Debug,
     V: Clone + fmt::Debug,
 {
+    /// Inspect the committed value hidden by this transaction's removal, if any.
+    /// Reject a newer committed change to this key with [`Error::Conflict`], so
+    /// a native owner cannot be recreated from obsolete membership.
+    /// The entry retains its existing write permit; the returned value is shared.
+    pub fn get_committed(&self) -> Result<Option<Arc<V>>> {
+        let state = self
+            .map_state
+            .read()
+            .expect("transaction bookkeeping poisoned");
+
+        state.check_pending(&self.txn_id)?;
+        if state
+            .deltas
+            .range((
+                std::ops::Bound::Excluded(self.txn_id),
+                std::ops::Bound::Unbounded,
+            ))
+            .any(|(_, version)| version.contains_key(&self.key))
+        {
+            return Err(Error::Conflict);
+        }
+
+        Ok(state.get_canon(&self.txn_id, &self.key))
+    }
+
     /// Insert a new value at this [`Entry`].
-    pub fn insert(self, value: V) -> TxnMapValueWriteGuard<K, V> {
-        let mut map_state = self.map_state.write().expect("lock state");
+    pub fn insert(self, value: V) -> Result<TxnMapValueWriteGuard<K, V>> {
+        let mut map_state = self
+            .map_state
+            .write()
+            .expect("transaction bookkeeping poisoned");
+
+        map_state.check_pending(&self.txn_id)?;
         let value = map_state.insert_new(self.txn_id, self.key, value);
-        TxnMapValueWriteGuard::new(self.permit, value)
+        Ok(TxnMapValueWriteGuard::new(self.permit, value))
     }
 
     /// Borrow this entry's key.
@@ -713,8 +757,12 @@ pub enum Entry<I, K, V> {
 }
 
 impl<I, K, V> Entry<I, K, V> {
+    /// Borrow the key of either an occupied or vacant entry.
     pub fn key(&self) -> &K {
-        todo!()
+        match self {
+            Self::Occupied(entry) => &entry.key,
+            Self::Vacant(entry) => &entry.key,
+        }
     }
 }
 
@@ -739,12 +787,14 @@ impl<I, K, V> Clone for TxnMapLock<I, K, V> {
 impl<I, K, V> TxnMapLock<I, K, V> {
     #[inline]
     fn state(&self) -> impl Deref<Target = State<I, K, V>> + '_ {
-        self.state.read().expect("lock state")
+        self.state.read().expect("transaction bookkeeping poisoned")
     }
 
     #[inline]
     fn state_mut(&self) -> impl DerefMut<Target = State<I, K, V>> + '_ {
-        self.state.write().expect("lock state")
+        self.state
+            .write()
+            .expect("transaction bookkeeping poisoned")
     }
 }
 
@@ -788,6 +838,7 @@ where
             .into_iter()
             .map(|(key, value)| (Key::new(key), Arc::new(value)))
             .collect();
+
         Self {
             state: Arc::new(RwLockInner::new(State::from_committed(canon))),
             semaphore: Semaphore::new(Collator::<K>::default()),
@@ -798,6 +849,8 @@ where
     pub async fn clear(&self, txn_id: I) -> Result<Canon<K, V>> {
         #[cfg(feature = "logging")]
         log::trace!("clear {self:?} at {txn_id:?}");
+
+        self.state().check_pending(&txn_id)?;
 
         let _permit = self.semaphore.write(txn_id, Range::All).await?;
 
@@ -869,6 +922,8 @@ where
     {
         #[cfg(feature = "logging")]
         log::trace!("extend {self:?} at {txn_id:?}");
+
+        self.state().check_pending(&txn_id)?;
 
         let _permit = self.semaphore.write(txn_id, Range::All).await?;
 
@@ -948,6 +1003,7 @@ where
             log::trace!(
                 "{self:?} is already committed at {txn_id:?}, no need for a read permit..."
             );
+
             return result;
         } else {
             #[cfg(feature = "log")]
@@ -1010,6 +1066,8 @@ where
         log::trace!("insert into {self:?} at {txn_id:?}");
 
         let key: Key<K> = key.into();
+        self.state().check_pending(&txn_id)?;
+
         let _permit = self.semaphore.write(txn_id, key.clone().into()).await?;
 
         let mut state = self.state_mut();
@@ -1123,7 +1181,9 @@ where
         let range = key.clone().into();
         let permit = self.semaphore.write(txn_id, range).await?;
 
-        if let Some(value) = self.state_mut().get_mut(txn_id, key.clone()) {
+        let mut state = self.state_mut();
+        state.check_pending(&txn_id)?;
+        if let Some(value) = state.get_mut(txn_id, key.clone()) {
             Ok(Entry::Occupied(EntryOccupied {
                 key,
                 value: TxnMapValueWriteGuard::new(permit, value),
@@ -1153,7 +1213,9 @@ where
         let key = key.into();
         let permit = self.semaphore.write(txn_id, key.clone().into()).await?;
 
-        if let Some(value) = self.state_mut().get_mut(txn_id, key) {
+        let mut state = self.state_mut();
+        state.check_pending(&txn_id)?;
+        if let Some(value) = state.get_mut(txn_id, key) {
             Ok(Some(TxnMapValueWriteGuard::new(permit, value)))
         } else {
             Ok(None)
@@ -1194,7 +1256,9 @@ where
         self.state().check_pending(&txn_id)?;
 
         let permit = self.semaphore.write(txn_id, Range::All).await?;
-        let keys = self.state().keys_pending(txn_id);
+        let state = self.state();
+        state.check_pending(&txn_id)?;
+        let keys = state.keys_pending(txn_id);
         Ok(IterMut::new(self.state.clone(), txn_id, permit, keys))
     }
 
@@ -1221,135 +1285,247 @@ where
     K: Eq + Hash + Ord + fmt::Debug + Send + Sync,
     V: fmt::Debug,
 {
+    /// Inspect whether this transaction has committed, without read admission.
+    /// IDs below the finalized cutoff return [`Error::Outdated`]; the cutoff
+    /// itself is committed. Callers coordinate external publication separately.
+    pub fn is_committed(&self, txn_id: I) -> Result<bool> {
+        self.state().check_committed(&txn_id)
+    }
+
+    /// Check decision eligibility without changing state or acquiring admission.
+    /// This checks the finalized cutoff and outstanding pending-value borrows;
+    /// it does not reserve a decision or replace the caller's quiescence obligation.
+    pub fn check_commit(&self, txn_id: I) -> Result<()> {
+        self.state().check_commit(&txn_id)
+    }
+
     /// Commit the state of this [`TxnMapLock`] at `txn_id`.
-    /// Panics:
-    ///  - if this [`TxnMapLock`] has already been finalized at `txn_id`
-    ///  - if any new value to commit is still locked (for reading or writing)
-    pub fn commit(&self, txn_id: I) {
+    /// Returns an error for an invalid decision or unavailable state.
+    pub fn commit(&self, txn_id: I) -> Result<()> {
         #[cfg(feature = "logging")]
         log::trace!("commit {self:?} at {txn_id:?}");
 
         let mut state = self.state_mut();
 
-        if state.finalized.as_ref() >= Some(&txn_id) {
-            panic!("tried to commit already-finalized version {:?}", txn_id);
+        if state.finalized == Some(txn_id) {
+            return Ok(());
         }
 
-        state.commit(txn_id);
+        if state.finalized.as_ref() > Some(&txn_id) {
+            return Err(Error::Outdated);
+        }
 
-        self.semaphore.finalize(&txn_id, false);
+        state.commit(txn_id)?;
+
+        self.semaphore.finalize(&txn_id, false)?;
+        Ok(())
     }
 
     /// Read and commit this [`TxnMapLock`] in a single operation.
-    /// Also returns the set of changes committed, if any.
+    /// Also returns the changes newly committed by this call, if any.
+    /// Repeated decisions return the historical snapshot without repeating changes.
     ///
-    /// Panics:
-    ///  - if this [`TxnMapLock`] has already been finalized at `txn_id`
-    ///  - if any new value to commit is still locked (for reading or writing)
-    pub async fn read_and_commit(&self, txn_id: I) -> (Canon<K, V>, Option<Delta<K, V>>) {
+    /// Returns an error for an invalid decision or unavailable state.
+    pub async fn read_and_commit(&self, txn_id: I) -> CommitResult<K, V> {
         #[cfg(feature = "logging")]
         log::trace!("read and commit {self:?} at {txn_id:?}");
 
-        let _permit = self
-            .semaphore
-            .read(txn_id, Range::All)
-            .await
-            .expect("permit");
-
-        let (version, deltas) = {
-            let mut state = self.state_mut();
-
-            if state.finalized > Some(txn_id) {
-                panic!("tried to commit already-finalized version {:?}", txn_id);
+        // Reject a known invalid decision before registering a reservation.
+        {
+            let state = self.state();
+            if state.check_committed(&txn_id)? {
+                return Ok((state.canon(&txn_id), None));
             }
+        }
 
-            state.commit(txn_id);
+        let _permit = self.semaphore.read(txn_id, Range::All).await?;
 
-            (state.canon(&txn_id), state.deltas.get(&txn_id).cloned())
-        };
+        let result = self.state_mut().read_and_commit(txn_id)?;
+        self.semaphore.finalize(&txn_id, false)?;
+        Ok(result)
+    }
 
-        self.semaphore.finalize(&txn_id, false);
+    /// Read and commit synchronously, returning [`Error::WouldBlock`] if causal
+    /// read admission is unavailable. A rejected call does not commit or release
+    /// reservations. Successful and repeated results match [`Self::read_and_commit`].
+    pub fn try_read_and_commit(&self, txn_id: I) -> CommitResult<K, V> {
+        let mut state = self.state_mut();
+        if state.check_committed(&txn_id)? {
+            return Ok((state.canon(&txn_id), None));
+        }
 
-        (version, deltas)
+        state.check_commit(&txn_id)?;
+
+        let _permit = self.semaphore.try_read(txn_id, Range::All)?;
+        let result = state.read_and_commit(txn_id)?;
+        drop(state);
+        self.semaphore.finalize(&txn_id, false)?;
+        Ok(result)
     }
 
     /// Roll back the state of this [`TxnMapLock`] at `txn_id`.
     ///
-    /// Panics: if this [`TxnMapLock`] has already been committed or finalized at `txn_id`
-    pub fn rollback(&self, txn_id: &I) {
-        self.semaphore.finalize(txn_id, false);
-
+    /// Returns an error for an invalid decision or unavailable state.
+    pub fn rollback(&self, txn_id: &I) -> Result<()> {
         let mut state = self.state_mut();
+        if state.finalized.as_ref() == Some(txn_id) {
+            return Ok(());
+        }
 
-        assert!(
-            !state.commits.contains(txn_id),
-            "cannot roll back committed transaction {:?}",
-            txn_id
-        );
+        if state.commits.contains(txn_id) {
+            return Err(Error::Committed);
+        }
 
         if state.finalized.as_ref() > Some(txn_id) {
-            panic!("tried to roll back finalized version at {:?}", txn_id);
+            return Err(Error::Outdated);
         }
 
         state.pending.remove(txn_id);
 
-        self.semaphore.finalize(txn_id, false);
+        self.semaphore.finalize(txn_id, false)?;
+        Ok(())
     }
 
     /// Read and roll back this [`TxnMapLock`] in a single operation.
     ///
-    /// Panics:
-    ///  - if this [`TxnMapLock`] has already been committed or finalized at `txn_id`
-    ///  - if any updated value is still locked for reading or writing
-    pub async fn read_and_rollback(&self, txn_id: I) -> (Canon<K, V>, Option<Delta<K, V>>) {
-        let _permit = self
-            .semaphore
-            .read(txn_id, Range::All)
-            .await
-            .expect("permit");
+    /// Returns discarded membership (the version that would have been committed),
+    /// sharing values without cloning payloads. The restored state remains available
+    /// through ordinary transactional reads.
+    /// Returns an error for an invalid decision or unavailable state.
+    pub async fn read_and_rollback(&self, txn_id: I) -> Result<Canon<K, V>> {
+        // Reject a known invalid decision before registering a reservation.
+        {
+            let state = self.state();
+            if state.finalized == Some(txn_id) {
+                return Ok(state.canon(&txn_id));
+            }
 
-        let (version, deltas) = {
-            let mut state = self.state_mut();
-
-            assert!(
-                !state.commits.contains(&txn_id),
-                "cannot roll back committed transaction {:?}",
-                txn_id
-            );
+            if state.commits.contains(&txn_id) {
+                return Err(Error::Committed);
+            }
 
             if state.finalized > Some(txn_id) {
-                panic!("tried to roll back finalized version at {:?}", txn_id);
+                return Err(Error::Outdated);
+            }
+        }
+
+        let _permit = self.semaphore.read(txn_id, Range::All).await?;
+
+        let discarded = {
+            let mut state = self.state_mut();
+            if state.finalized == Some(txn_id) {
+                return Ok(state.canon(&txn_id));
             }
 
-            // note: this removes the pending version, i.e. it returns the version that WOULD be committed
-            let deltas = state.commit_version(&txn_id);
-
-            let mut version = state.canon(&txn_id);
-
-            if let Some(deltas) = &deltas {
-                merge(&mut version, deltas);
+            if state.commits.contains(&txn_id) {
+                return Err(Error::Committed);
             }
 
-            (version, deltas)
+            if state.finalized > Some(txn_id) {
+                return Err(Error::Outdated);
+            }
+
+            let deltas = state.commit_version(&txn_id)?;
+            let mut discarded = state.canon(&txn_id);
+            if let Some(deltas) = deltas {
+                merge_owned(&mut discarded, deltas);
+            }
+
+            discarded
         };
 
-        self.semaphore.finalize(&txn_id, false);
+        self.semaphore.finalize(&txn_id, false)?;
 
-        (version, deltas)
+        Ok(discarded)
     }
 
     /// Finalize the state of this [`TxnMapLock`] at `txn_id`.
     /// This will finalize commits and prevent further reads of all versions earlier than `txn_id`.
-    pub fn finalize(&self, txn_id: I) {
-        self.semaphore.finalize(&txn_id, true);
-        self.state_mut().finalize(txn_id);
+    pub fn finalize(&self, txn_id: I) -> Result<()> {
+        let mut state = self.state_mut();
+        self.semaphore.finalize(&txn_id, true)?;
+        state.finalize(txn_id);
+        Ok(())
     }
 
     /// Read and finalize the state of this [`TxnMapLock`] at `txn_id`, if not already finalized.
     /// This will finalize commits and prevent further reads of all versions earlier than `txn_id`.
-    pub fn read_and_finalize(&self, txn_id: I) -> Option<Canon<K, V>> {
-        self.semaphore.finalize(&txn_id, true);
-        self.state_mut().finalize(txn_id).cloned()
+    pub fn read_and_finalize(&self, txn_id: I) -> Result<Option<Canon<K, V>>> {
+        let mut state = self.state_mut();
+        self.semaphore.finalize(&txn_id, true)?;
+        Ok(state.finalize(txn_id).cloned())
+    }
+
+    /// Inspect this key's finalized baseline, latest committed value, and cutoff.
+    ///
+    /// Pending values are excluded, including when they are borrowed. This is
+    /// metadata inspection, not transactional read admission: the caller retains
+    /// its transactional guard and separately protects native publication. The
+    /// callback runs under bookkeeping protection and must not block or reenter.
+    pub fn inspect_committed<Q, R>(
+        &self,
+        txn_id: I,
+        key: &Q,
+        inspect: impl FnOnce(Option<&V>, Option<&V>, Option<I>) -> R,
+    ) -> Result<R>
+    where
+        Q: Eq + Hash + ?Sized,
+        Key<K>: Borrow<Q>,
+    {
+        let state = self.state();
+        if state.finalized > Some(txn_id) {
+            return Err(Error::Outdated);
+        }
+
+        let baseline = state.canon.get(key).map(|value| value.as_ref());
+        let latest = state
+            .deltas
+            .values()
+            .rev()
+            .find_map(|version| version.get(key))
+            .map_or(baseline, |value| value.as_deref());
+
+        Ok(inspect(baseline, latest, state.finalized))
+    }
+
+    /// Inspect retained canonical, committed, and pending entries synchronously.
+    ///
+    /// `None` identifies the finalized baseline; other IDs identify retained
+    /// versions, including removals. Pending values in use return `WouldBlock`.
+    /// The callback must not reenter this lock. Callers coordinating native
+    /// storage must protect publication separately; no guard escapes this call.
+    pub fn inspect_versions(
+        &self,
+        txn_id: I,
+        mut inspect: impl FnMut(Option<I>, &K, Option<&V>),
+    ) -> Result<()> {
+        let state = self.state();
+        if state.finalized > Some(txn_id) {
+            return Err(Error::Outdated);
+        }
+
+        for (key, value) in &state.canon {
+            inspect(None, key, Some(value));
+        }
+
+        for (id, version) in &state.deltas {
+            for (key, value) in version {
+                inspect(Some(*id), key, value.as_deref());
+            }
+        }
+
+        for (id, version) in &state.pending {
+            for (key, value) in version {
+                if let Some(value) = value {
+                    let value = value.try_read().map_err(|_| Error::WouldBlock)?;
+                    inspect(Some(*id), key, Some(&value));
+                } else {
+                    inspect(Some(*id), key, None);
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -1359,19 +1535,15 @@ impl<I, K, V> fmt::Debug for TxnMapLock<I, K, V> {
     }
 }
 
-/// A guard on a value in an [`Iter`]
+/// A guard on a value in an [`Iter`]. Pending native access retains its permit
+/// independently of the iterator, and drops before releasing that permit.
 #[derive(Debug)]
-pub struct TxnMapLockIterGuard<V> {
+pub struct TxnMapLockIterGuard<K, V> {
     value: PendingValue<V>,
+    _permit: Option<Arc<PermitRead<Range<K>>>>,
 }
 
-impl<V> From<PendingValue<V>> for TxnMapLockIterGuard<V> {
-    fn from(value: PendingValue<V>) -> Self {
-        Self { value }
-    }
-}
-
-impl<V> Deref for TxnMapLockIterGuard<V> {
+impl<K, V> Deref for TxnMapLockIterGuard<K, V> {
     type Target = V;
 
     fn deref(&self) -> &Self::Target {
@@ -1382,13 +1554,13 @@ impl<V> Deref for TxnMapLockIterGuard<V> {
     }
 }
 
-impl<V: PartialEq> PartialEq<V> for TxnMapLockIterGuard<V> {
+impl<K, V: PartialEq> PartialEq<V> for TxnMapLockIterGuard<K, V> {
     fn eq(&self, other: &V) -> bool {
         self.deref().eq(other)
     }
 }
 
-impl<V: PartialOrd> PartialOrd<V> for TxnMapLockIterGuard<V> {
+impl<K, V: PartialOrd> PartialOrd<V> for TxnMapLockIterGuard<K, V> {
     fn partial_cmp(&self, other: &V) -> Option<Ordering> {
         self.deref().partial_cmp(other)
     }
@@ -1398,8 +1570,8 @@ impl<V: PartialOrd> PartialOrd<V> for TxnMapLockIterGuard<V> {
 pub struct Iter<I, K, V> {
     lock_state: Arc<RwLockInner<State<I, K, V>>>,
     txn_id: I,
-    permit: Option<PermitRead<Range<K>>>,
     keys: <HashSet<Key<K>> as IntoIterator>::IntoIter,
+    permit: Option<Arc<PermitRead<Range<K>>>>,
 }
 
 impl<I, K, V> Iter<I, K, V> {
@@ -1412,7 +1584,7 @@ impl<I, K, V> Iter<I, K, V> {
         Self {
             lock_state,
             txn_id,
-            permit,
+            permit: permit.map(Arc::new),
             keys: keys.into_iter(),
         }
     }
@@ -1424,7 +1596,7 @@ where
     K: Hash + Ord,
     V: fmt::Debug,
 {
-    type Item = (Key<K>, TxnMapLockIterGuard<V>);
+    type Item = (Key<K>, TxnMapLockIterGuard<K, V>);
 
     fn next(&mut self) -> Option<Self::Item> {
         let state = self.lock_state.read().expect("lock state");
@@ -1433,7 +1605,17 @@ where
             let key = self.keys.next()?;
             let value = get_key(&state, &self.txn_id, &key, self.permit.is_none());
             if let Some(value) = value {
-                return Some((key, value.into()));
+                let permit = matches!(&value, PendingValue::Pending(_))
+                    .then(|| self.permit.clone())
+                    .flatten();
+
+                return Some((
+                    key,
+                    TxnMapLockIterGuard {
+                        value,
+                        _permit: permit,
+                    },
+                ));
             }
         }
     }
@@ -1464,13 +1646,15 @@ where
     }
 }
 
-/// A guard on a mutable value in an [`IterMut`]
+/// A guard on a mutable value in an [`IterMut`]. It retains write authority
+/// until native access is released, even after its iterator is dropped.
 #[derive(Debug)]
-pub struct TxnMapLockIterMutGuard<V> {
+pub struct TxnMapLockIterMutGuard<K, V> {
     guard: OwnedRwLockWriteGuard<V>,
+    _permit: Arc<PermitWrite<Range<K>>>,
 }
 
-impl<V> Deref for TxnMapLockIterMutGuard<V> {
+impl<K, V> Deref for TxnMapLockIterMutGuard<K, V> {
     type Target = V;
 
     fn deref(&self) -> &Self::Target {
@@ -1478,27 +1662,21 @@ impl<V> Deref for TxnMapLockIterMutGuard<V> {
     }
 }
 
-impl<V> DerefMut for TxnMapLockIterMutGuard<V> {
+impl<K, V> DerefMut for TxnMapLockIterMutGuard<K, V> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.guard.deref_mut()
     }
 }
 
-impl<V: PartialEq> PartialEq<V> for TxnMapLockIterMutGuard<V> {
+impl<K, V: PartialEq> PartialEq<V> for TxnMapLockIterMutGuard<K, V> {
     fn eq(&self, other: &V) -> bool {
         self.deref().eq(other)
     }
 }
 
-impl<V: PartialOrd> PartialOrd<V> for TxnMapLockIterMutGuard<V> {
+impl<K, V: PartialOrd> PartialOrd<V> for TxnMapLockIterMutGuard<K, V> {
     fn partial_cmp(&self, other: &V) -> Option<Ordering> {
         self.deref().partial_cmp(other)
-    }
-}
-
-impl<V> From<OwnedRwLockWriteGuard<V>> for TxnMapLockIterMutGuard<V> {
-    fn from(guard: OwnedRwLockWriteGuard<V>) -> Self {
-        Self { guard }
     }
 }
 
@@ -1507,8 +1685,8 @@ pub struct IterMut<I, K, V> {
     lock_state: Arc<RwLockInner<State<I, K, V>>>,
     txn_id: I,
 
-    _permit: PermitWrite<Range<K>>,
     keys: <HashSet<Key<K>> as IntoIterator>::IntoIter,
+    _permit: Arc<PermitWrite<Range<K>>>,
 }
 
 impl<I, K, V> IterMut<I, K, V> {
@@ -1521,7 +1699,7 @@ impl<I, K, V> IterMut<I, K, V> {
         Self {
             lock_state,
             txn_id,
-            _permit: permit,
+            _permit: Arc::new(permit),
             keys: keys.into_iter(),
         }
     }
@@ -1533,7 +1711,7 @@ where
     K: Hash + Ord,
     V: Clone + fmt::Debug,
 {
-    type Item = (Arc<K>, TxnMapLockIterMutGuard<V>);
+    type Item = (Arc<K>, TxnMapLockIterMutGuard<K, V>);
 
     fn next(&mut self) -> Option<Self::Item> {
         let mut state = self.lock_state.write().expect("lock state");
@@ -1541,23 +1719,19 @@ where
         loop {
             let key = self.keys.next()?;
             if let Some(guard) = state.get_mut(self.txn_id, key.clone()) {
-                return Some((key.into(), TxnMapLockIterMutGuard::from(guard)));
+                return Some((
+                    key.into(),
+                    TxnMapLockIterMutGuard {
+                        guard,
+                        _permit: self._permit.clone(),
+                    },
+                ));
             }
         }
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.keys.size_hint()
-    }
-}
-
-#[inline]
-fn merge<K: Eq + Hash, V>(version: &mut Canon<K, V>, deltas: &Delta<K, V>) {
-    for (key, delta) in deltas {
-        match delta {
-            Some(value) => version.insert(key.clone(), value.clone()),
-            None => version.remove(key),
-        };
     }
 }
 
@@ -1589,29 +1763,32 @@ mod tests {
             .unwrap()
             .map(|(key, _)| (*key).clone())
             .collect::<BTreeSet<_>>();
+
         assert_eq!(before, BTreeSet::from(["base".to_string()]));
 
-        map.rollback(&2);
+        map.rollback(&2).unwrap();
         map.insert(3, "committed".to_string(), 3).await.unwrap();
-        map.commit(3);
+        map.commit(3).unwrap();
         let before_finalize = map
             .iter(4)
             .await
             .unwrap()
             .map(|(key, _)| (*key).clone())
             .collect::<BTreeSet<_>>();
+
         assert_eq!(
             before_finalize,
             BTreeSet::from(["base".to_string(), "committed".to_string()])
         );
 
-        map.finalize(3);
+        map.finalize(3).unwrap();
         let after_finalize = map
             .iter(4)
             .await
             .unwrap()
             .map(|(key, _)| (*key).clone())
             .collect::<BTreeSet<_>>();
+
         assert_eq!(after_finalize, before_finalize);
     }
 
@@ -1628,6 +1805,7 @@ mod tests {
             .await
             .expect("an older write must not wait behind a newer read")
             .expect_err("an older write must conflict with the held snapshot");
+
             assert_eq!(conflict, Error::Conflict);
         }
     }

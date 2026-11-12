@@ -1,9 +1,8 @@
 /// Transactional queue structures.
+use std::collections::btree_map::Entry;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::hash::Hash;
-
-use ds_ext::map::{Entry, OrdHashMap};
-use ds_ext::set::OrdHashSet;
 
 use super::Error;
 
@@ -11,16 +10,16 @@ pub mod message;
 pub mod task;
 
 struct State<I, S> {
-    pending: OrdHashMap<I, S>,
-    commits: OrdHashSet<I>,
+    pending: BTreeMap<I, S>,
+    commits: BTreeSet<I>,
     finalized: Option<I>,
 }
 
 impl<I, S> State<I, S> {
     fn new() -> Self {
         Self {
-            pending: OrdHashMap::new(),
-            commits: OrdHashSet::new(),
+            pending: BTreeMap::new(),
+            commits: BTreeSet::new(),
             finalized: None,
         }
     }
@@ -45,49 +44,39 @@ impl<I, S> State<I, S>
 where
     I: Eq + Hash + Ord + fmt::Debug,
 {
-    fn commit(&mut self, txn_id: I) -> Option<S> {
-        assert!(
-            self.finalized.as_ref() < Some(&txn_id),
-            "queue is already finalized at {txn_id:?}"
-        );
+    fn commit(&mut self, txn_id: I) -> Result<Option<S>, Error> {
+        if self.finalized.as_ref() >= Some(&txn_id) {
+            return Err(Error::Outdated);
+        }
 
         let queue = self.pending.remove(&txn_id);
         self.commits.insert(txn_id);
-        queue
+        Ok(queue)
     }
 
-    fn rollback(&mut self, txn_id: &I) -> Option<S> {
-        assert!(
-            self.finalized.as_ref() < Some(txn_id),
-            "queue is already finalized at {txn_id:?}"
-        );
+    fn rollback(&mut self, txn_id: &I) -> Result<Option<S>, Error> {
+        if self.finalized.as_ref() >= Some(txn_id) {
+            return Err(Error::Outdated);
+        }
 
-        assert!(
-            !self.commits.contains(txn_id),
-            "queue is already committed at {txn_id:?}"
-        );
+        if self.commits.contains(txn_id) {
+            return Err(Error::Committed);
+        }
 
-        self.pending.remove(txn_id)
+        Ok(self.pending.remove(txn_id))
     }
 
     fn finalize(&mut self, txn_id: I) {
-        while self
-            .commits
-            .first()
-            .map(|version_id| version_id <= &txn_id)
-            .unwrap_or_default()
-        {
+        while self.commits.first().is_some_and(|id| id <= &txn_id) {
             self.commits.pop_first();
         }
 
-        while self
-            .pending
-            .keys()
-            .next()
-            .map(|version_id| version_id <= &txn_id)
-            .unwrap_or_default()
-        {
-            self.pending.pop_first();
+        while let Some(entry) = self.pending.first_entry() {
+            if entry.key() > &txn_id {
+                break;
+            }
+
+            entry.remove_entry();
         }
 
         if self.finalized.as_ref() > Some(&txn_id) {

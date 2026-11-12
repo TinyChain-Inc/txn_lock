@@ -9,8 +9,8 @@ use super::semaphore::{PermitRead, PermitWrite};
 /// A permit to read a value in a pending read transaction
 #[derive(Debug)]
 pub struct PendingRead<R, T> {
-    permit: PermitRead<R>,
     value: Arc<T>,
+    permit: PermitRead<R>,
 }
 
 impl<R, F> PendingRead<R, F> {
@@ -19,9 +19,12 @@ impl<R, F> PendingRead<R, F> {
     where
         MapFn: FnOnce(&F) -> Result<T, E>,
     {
-        map(&*self.value).map(|value| PendingMap {
-            _permit: self.permit,
+        let mapped = map(&*self.value);
+        let Self { value, permit } = self;
+        drop(value);
+        mapped.map(|value| PendingMap {
             value,
+            _permit: permit,
         })
     }
 }
@@ -37,8 +40,8 @@ impl<R, T> Deref for PendingRead<R, T> {
 /// A permit to read a value in a pending transaction
 #[derive(Debug)]
 pub struct PendingWrite<R, T> {
-    permit: PermitRead<R>,
     value: OwnedRwLockReadGuard<T>,
+    permit: PermitRead<R>,
 }
 
 impl<R, F> PendingWrite<R, F> {
@@ -47,9 +50,12 @@ impl<R, F> PendingWrite<R, F> {
     where
         MapFn: FnOnce(&F) -> Result<T, E>,
     {
-        map(&*self.value).map(|value| PendingMap {
-            _permit: self.permit,
+        let mapped = map(&*self.value);
+        let Self { value, permit } = self;
+        drop(value);
+        mapped.map(|value| PendingMap {
             value,
+            _permit: permit,
         })
     }
 }
@@ -65,8 +71,8 @@ impl<R, T> Deref for PendingWrite<R, T> {
 /// A permit to read a mapped value in a pending transaction
 #[derive(Debug)]
 pub struct PendingMap<R, T> {
-    _permit: PermitRead<R>,
     value: T,
+    _permit: PermitRead<R>,
 }
 
 impl<R, T> Deref for PendingMap<R, T> {
@@ -157,11 +163,12 @@ impl<R, T> Deref for TxnReadGuardMap<R, T> {
     }
 }
 
-/// A write guard on a transactional value
+/// A write guard on a transactional value. Native access drops before the permit
+/// can notify another transaction or writer.
 #[derive(Debug)]
 pub struct TxnWriteGuard<R, T> {
-    _permit: PermitWrite<R>,
     value: OwnedRwLockWriteGuard<T>,
+    _permit: PermitWrite<R>,
 }
 
 impl<R, T> TxnWriteGuard<R, T> {

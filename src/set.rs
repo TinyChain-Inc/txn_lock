@@ -19,7 +19,7 @@
 //! block_on(set.insert(1, one.to_string())).expect("insert");
 //! assert!(set.try_contains(1, one).expect("contains"));
 //! assert_eq!(set.try_insert(2, one.to_string()).unwrap_err(), Error::WouldBlock);
-//! set.commit(1);
+//! set.commit(1).unwrap();
 //!
 //! assert!(set.try_contains(2, one).expect("contains"));
 //! assert_eq!(
@@ -32,14 +32,14 @@
 //! assert!(!set.try_contains(2, one).expect("contains"));
 //! assert!(!set.try_remove(2, two).expect("remove"));
 //! set.try_insert(2, two.to_string()).expect("insert");
-//! set.finalize(2);
+//! set.finalize(2).unwrap();
 //!
 //! assert_eq!(set.try_contains(1, one).unwrap_err(), Error::Outdated);
 //! assert!(set.try_contains(3, one).expect("contains"));
 //! assert!(set.try_remove(3, one).expect("remove"));
 //! assert!(!set.try_remove(3, one).expect("remove"));
 //! assert!(!set.try_remove(3, two).expect("remove"));
-//! set.commit(3);
+//! set.commit(3).unwrap();
 //!
 //! let new_values: HashSet<String> = ["one", "two", "three", "four"]
 //!     .into_iter()
@@ -56,7 +56,7 @@
 use std::borrow::Borrow;
 use std::cmp::Ordering;
 use std::collections::hash_map::{self, HashMap};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::hash::Hash;
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, RwLock as RwLockInner};
@@ -64,22 +64,20 @@ use std::task::Poll;
 use std::{fmt, iter};
 
 use collate::Collator;
-use ds_ext::{OrdHashMap, OrdHashSet};
 use futures::TryFutureExt;
 
+pub use super::range::{Key, Range};
 use super::semaphore::{PermitRead, Semaphore};
 use super::{Error, Result};
-
-pub use super::range::{Key, Range};
 
 type Delta<T> = HashMap<Key<T>, bool>;
 type Canon<T> = HashSet<Key<T>>;
 
 struct State<I, T> {
     canon: Canon<T>,
-    deltas: OrdHashMap<I, Delta<T>>,
-    commits: OrdHashSet<I>,
-    pending: OrdHashMap<I, Delta<T>>,
+    deltas: BTreeMap<I, Delta<T>>,
+    commits: BTreeSet<I>,
+    pending: BTreeMap<I, Delta<T>>,
     finalized: Option<I>,
 }
 
@@ -89,9 +87,9 @@ impl<I: Ord + Hash + fmt::Debug, T: Eq + Hash> State<I, T> {
 
         State {
             canon: Canon::new(),
-            deltas: OrdHashMap::new(),
-            commits: OrdHashSet::new(),
-            pending: OrdHashMap::from_iter(iter::once((txn_id, delta))),
+            deltas: BTreeMap::new(),
+            commits: BTreeSet::new(),
+            pending: BTreeMap::from_iter(iter::once((txn_id, delta))),
             finalized: None,
         }
     }
@@ -102,7 +100,7 @@ impl<I: Copy + Hash + Ord + fmt::Debug, T: Hash + Ord> State<I, T> {
     fn canon(&self, txn_id: &I) -> Canon<T> {
         let mut canon = self.canon.clone();
 
-        for (_, delta) in self.deltas.iter().take_while(|(id, _)| *id <= txn_id) {
+        for (_, delta) in self.deltas.range(..=txn_id) {
             merge(&mut canon, delta);
         }
 
@@ -110,8 +108,17 @@ impl<I: Copy + Hash + Ord + fmt::Debug, T: Hash + Ord> State<I, T> {
     }
 
     #[inline]
+    fn check_committed(&self, txn_id: &I) -> Result<bool> {
+        match self.finalized.as_ref().cmp(&Some(txn_id)) {
+            Ordering::Greater => Err(Error::Outdated),
+            Ordering::Equal => Ok(true),
+            Ordering::Less => Ok(self.commits.contains(txn_id)),
+        }
+    }
+
+    #[inline]
     fn check_pending(&self, txn_id: &I) -> Result<()> {
-        if self.finalized.as_ref() > Some(txn_id) {
+        if self.finalized.as_ref() >= Some(txn_id) {
             Err(Error::Outdated)
         } else if self.commits.contains(txn_id) {
             Err(Error::Committed)
@@ -147,16 +154,10 @@ impl<I: Copy + Hash + Ord + fmt::Debug, T: Hash + Ord> State<I, T> {
         Q: Eq + Hash + ?Sized,
         Key<T>: Borrow<Q>,
     {
-        match self.finalized.as_ref().cmp(&Some(txn_id)) {
-            Ordering::Greater => Poll::Ready(Err(Error::Outdated)),
-            Ordering::Equal => Poll::Ready(Ok(self.contains_canon(txn_id, key))),
-            Ordering::Less => {
-                if self.commits.contains(txn_id) {
-                    Poll::Ready(Ok(self.contains_canon(txn_id, key)))
-                } else {
-                    Poll::Pending
-                }
-            }
+        match self.check_committed(txn_id) {
+            Ok(true) => Poll::Ready(Ok(self.contains_canon(txn_id, key))),
+            Ok(false) => Poll::Pending,
+            Err(cause) => Poll::Ready(Err(cause)),
         }
     }
 
@@ -181,29 +182,25 @@ impl<I: Copy + Hash + Ord + fmt::Debug, T: Hash + Ord> State<I, T> {
             return None;
         }
 
-        while let Some(version_id) = self.pending.keys().next().copied() {
-            if version_id <= txn_id {
-                self.pending.pop_first();
-            } else {
+        while let Some(entry) = self.pending.first_entry() {
+            if entry.key() > &txn_id {
                 break;
             }
+
+            entry.remove_entry();
         }
 
-        while let Some(version_id) = self.commits.first().copied() {
-            if version_id <= txn_id {
-                self.commits.pop_first();
-            } else {
-                break;
-            }
+        while self.commits.first().is_some_and(|id| id <= &txn_id) {
+            self.commits.pop_first();
         }
 
-        while let Some(version_id) = self.deltas.keys().next().copied() {
-            if version_id <= txn_id {
-                let version = self.deltas.pop_first().expect("version");
-                merge_owned(&mut self.canon, version);
-            } else {
+        while let Some(entry) = self.deltas.first_entry() {
+            if entry.key() > &txn_id {
                 break;
             }
+
+            let (_, version) = entry.remove_entry();
+            merge_owned(&mut self.canon, version);
         }
 
         self.finalized = Some(txn_id);
@@ -263,7 +260,7 @@ impl<I: Copy + Hash + Ord + fmt::Debug, T: Hash + Ord> State<I, T> {
 #[inline]
 fn contains_canon<I, T, Q>(
     canon: &Canon<T>,
-    deltas: &OrdHashMap<I, Delta<T>>,
+    deltas: &BTreeMap<I, Delta<T>>,
     txn_id: &I,
     key: &Q,
 ) -> bool
@@ -273,11 +270,7 @@ where
     Q: Eq + Hash + ?Sized,
     Key<T>: Borrow<Q>,
 {
-    let deltas = deltas
-        .iter()
-        .rev()
-        .skip_while(|(id, _)| *id > txn_id)
-        .map(|(_, version)| version);
+    let deltas = deltas.range(..=txn_id).rev().map(|(_, version)| version);
 
     for delta in deltas {
         if let Some(key_state) = delta.get(key) {
@@ -306,12 +299,14 @@ impl<I, T> Clone for TxnSetLock<I, T> {
 impl<I, T> TxnSetLock<I, T> {
     #[inline]
     fn state(&self) -> impl Deref<Target = State<I, T>> + '_ {
-        self.state.read().expect("lock state")
+        self.state.read().expect("transaction bookkeeping poisoned")
     }
 
     #[inline]
     fn state_mut(&self) -> impl DerefMut<Target = State<I, T>> + '_ {
-        self.state.write().expect("lock state")
+        self.state
+            .write()
+            .expect("transaction bookkeeping poisoned")
     }
 }
 
@@ -368,7 +363,12 @@ where
         };
 
         let _permit = self.semaphore.read(txn_id, range).await?;
-        Ok(self.state().contains_pending(&txn_id, key))
+        let state = self.state();
+        if let Poll::Ready(result) = state.contains_committed(&txn_id, key) {
+            return result;
+        }
+
+        Ok(state.contains_pending(&txn_id, key))
     }
 
     /// Synchronously check whether the given `key` is present in this [`TxnSetLock`], if possible.
@@ -389,6 +389,8 @@ where
 
     /// Remove and return all keys in this [`TxnSetLock`] at `txn_id`.
     pub async fn clear(&self, txn_id: I) -> Result<Canon<T>> {
+        self.state().check_pending(&txn_id)?;
+
         let _permit = self.semaphore.write(txn_id, Range::All).await?;
 
         let mut state = self.state_mut();
@@ -409,10 +411,10 @@ where
 
     /// Remove and return all keys in this [`TxnSetLock`] at `txn_id` synchronously, if possible.
     pub fn try_clear(&self, txn_id: I) -> Result<Canon<T>> {
-        let _permit = self.semaphore.try_write(txn_id, Range::All)?;
-
         let mut state = self.state_mut();
         state.check_pending(&txn_id)?;
+
+        let _permit = self.semaphore.try_write(txn_id, Range::All)?;
 
         let mut set = state.canon(&txn_id);
 
@@ -433,6 +435,8 @@ where
         K: Into<Key<T>>,
         E: IntoIterator<Item = K>,
     {
+        self.state().check_pending(&txn_id)?;
+
         let _permit = self.semaphore.write(txn_id, Range::All).await?;
 
         let mut state = self.state_mut();
@@ -451,10 +455,10 @@ where
         K: Into<Key<T>>,
         E: IntoIterator<Item = K>,
     {
-        let _permit = self.semaphore.try_write(txn_id, Range::All)?;
-
         let mut state = self.state_mut();
         state.check_pending(&txn_id)?;
+
+        let _permit = self.semaphore.try_write(txn_id, Range::All)?;
 
         for key in other {
             state.insert(txn_id, key.into());
@@ -465,9 +469,12 @@ where
 
     /// Construct an iterator over this [`TxnSetLock`] at `txn_id`.
     pub async fn iter(&self, txn_id: I) -> Result<Iter<T>> {
+        self.state().check_committed(&txn_id)?;
+
         let permit = self.semaphore.read(txn_id, Range::All).await?;
 
         let state = self.state();
+        state.check_committed(&txn_id)?;
 
         let mut set = state.canon(&txn_id);
         if let Some(delta) = state.pending.get(&txn_id) {
@@ -479,9 +486,10 @@ where
 
     /// Construct an iterator over this [`TxnSetLock`] at `txn_id` synchronously, if possible.
     pub fn try_iter(&self, txn_id: I) -> Result<Iter<T>> {
-        let permit = self.semaphore.try_read(txn_id, Range::All)?;
-
         let state = self.state();
+        state.check_committed(&txn_id)?;
+
+        let permit = self.semaphore.try_read(txn_id, Range::All)?;
 
         let mut set = state.canon(&txn_id);
         if let Some(delta) = state.pending.get(&txn_id) {
@@ -494,6 +502,8 @@ where
     /// Insert a new `key` into this [`TxnSetLock`] at `txn_id`.
     pub async fn insert<K: Into<Key<T>>>(&self, txn_id: I, key: K) -> Result<()> {
         let key = key.into();
+        self.state().check_pending(&txn_id)?;
+
         let _permit = self.semaphore.write(txn_id, key.clone().into()).await?;
 
         let mut state = self.state_mut();
@@ -506,10 +516,10 @@ where
     /// Insert a new `key` into this [`TxnSetLock`] at `txn_id` synchronously, if possible.
     pub fn try_insert<K: Into<Key<T>>>(&self, txn_id: I, key: K) -> Result<()> {
         let key = key.into();
-        let _permit = self.semaphore.try_write(txn_id, key.clone().into())?;
-
         let mut state = self.state_mut();
         state.check_pending(&txn_id)?;
+
+        let _permit = self.semaphore.try_write(txn_id, key.clone().into())?;
 
         state.insert(txn_id, key);
         Ok(())
@@ -522,9 +532,12 @@ where
 
     /// Get the size of this [`TxnSetLock`] at the given `txn_id`.
     pub async fn len(&self, txn_id: I) -> Result<usize> {
+        self.state().check_committed(&txn_id)?;
+
         let _permit = self.semaphore.read(txn_id, Range::All).await?;
 
         let state = self.state();
+        state.check_committed(&txn_id)?;
 
         let mut set = state.canon(&txn_id);
         if let Some(delta) = state.pending.get(&txn_id) {
@@ -540,9 +553,13 @@ where
         Q: Eq + Hash + ToOwned<Owned = T> + ?Sized,
         Key<T>: Borrow<Q>,
     {
-        let key: Key<T> = (key, self.state().key(&txn_id, key)).into();
+        let key: Key<T> = {
+            let state = self.state();
+            state.check_pending(&txn_id)?;
+            (key, state.key(&txn_id, key)).into()
+        };
 
-        let _permit = self.semaphore.try_write(txn_id, key.clone().into())?;
+        let _permit = self.semaphore.write(txn_id, key.clone().into()).await?;
 
         let mut state = self.state_mut();
         state.check_pending(&txn_id)?;
@@ -572,35 +589,44 @@ where
     T: Hash + Ord + fmt::Debug + Send + Sync,
 {
     /// Commit the state of this [`TxnSetLock`] at `txn_id`.
-    /// Panics: if this [`TxnSetLock`] has already been finalized at `txn_id`
-    pub fn commit(&self, txn_id: I) {
+    /// Returns an error for an invalid decision or unavailable state.
+    pub fn commit(&self, txn_id: I) -> Result<()> {
         let mut state = self.state_mut();
 
-        if state.finalized >= Some(txn_id) {
-            panic!("tried to commit already-finalized version {:?}", txn_id);
+        if state.finalized == Some(txn_id) {
+            return Ok(());
+        }
+
+        if state.finalized > Some(txn_id) {
+            return Err(Error::Outdated);
         }
 
         state.commit(txn_id);
 
-        self.semaphore.finalize(&txn_id, false);
+        self.semaphore.finalize(&txn_id, false)?;
+        Ok(())
     }
 
     /// Read and commit of this [`TxnSetLock`] in a single operation, if there is a version pending.
-    /// Also returns the set of changes committed, if any.
+    /// Also returns the changes newly committed by this call, if any.
+    /// Repeated decisions return the historical snapshot without repeating changes.
     ///
-    /// Panics: if this [`TxnSetLock`] has already been finalized at `txn_id`
-    pub async fn read_and_commit(&self, txn_id: I) -> (Canon<T>, Option<Delta<T>>) {
-        let _permit = self
-            .semaphore
-            .read(txn_id, Range::All)
-            .await
-            .expect("permit");
+    /// Returns an error for an invalid decision or unavailable state.
+    pub async fn read_and_commit(&self, txn_id: I) -> Result<(Canon<T>, Option<Delta<T>>)> {
+        // Reject a known invalid decision before registering a reservation.
+        {
+            let state = self.state();
+            if state.check_committed(&txn_id)? {
+                return Ok((state.canon(&txn_id), None));
+            }
+        }
+
+        let _permit = self.semaphore.read(txn_id, Range::All).await?;
 
         let (version, delta) = {
             let mut state = self.state_mut();
-
-            if state.finalized > Some(txn_id) {
-                panic!("tried to commit already-finalized version {:?}", txn_id);
+            if state.check_committed(&txn_id)? {
+                return Ok((state.canon(&txn_id), None));
             }
 
             state.commit(txn_id);
@@ -608,53 +634,68 @@ where
             (state.canon(&txn_id), state.deltas.get(&txn_id).cloned())
         };
 
-        self.semaphore.finalize(&txn_id, false);
+        self.semaphore.finalize(&txn_id, false)?;
 
-        (version, delta)
+        Ok((version, delta))
     }
 
     /// Roll back the state of this [`TxnSetLock`] at `txn_id`.
-    /// Panics: if this [`TxnSetLock`] has already been committed or finalized at `txn_id`
-    pub fn rollback(&self, txn_id: &I) {
+    /// Returns an error for an invalid decision or unavailable state.
+    pub fn rollback(&self, txn_id: &I) -> Result<()> {
         let mut state = self.state_mut();
+        if state.finalized.as_ref() == Some(txn_id) {
+            return Ok(());
+        }
 
-        assert!(
-            !state.commits.contains(txn_id),
-            "cannot roll back committed transaction {:?}",
-            txn_id
-        );
+        if state.commits.contains(txn_id) {
+            return Err(Error::Committed);
+        }
 
         if state.finalized.as_ref() > Some(txn_id) {
-            panic!("tried to roll back finalized version at {:?}", txn_id);
+            return Err(Error::Outdated);
         }
 
         state.pending.remove(txn_id);
 
-        self.semaphore.finalize(txn_id, false);
+        self.semaphore.finalize(txn_id, false)?;
+        Ok(())
     }
 
     /// Read and roll back this [`TxnSetLock`] in a single operation, if there is a version pending.
     /// Also returns the set of changes rolled back, if any.
     ///
-    /// Panics: if this [`TxnSetLock`] has already been committed or finalized at `txn_id`
-    pub async fn read_and_rollback(&self, txn_id: I) -> (Canon<T>, Option<Delta<T>>) {
-        let _permit = self
-            .semaphore
-            .read(txn_id, Range::All)
-            .await
-            .expect("permit");
+    /// Returns an error for an invalid decision or unavailable state.
+    pub async fn read_and_rollback(&self, txn_id: I) -> Result<(Canon<T>, Option<Delta<T>>)> {
+        // Reject a known invalid decision before registering a reservation.
+        {
+            let state = self.state();
+            if state.finalized == Some(txn_id) {
+                return Ok((state.canon(&txn_id), None));
+            }
+
+            if state.commits.contains(&txn_id) {
+                return Err(Error::Committed);
+            }
+
+            if state.finalized > Some(txn_id) {
+                return Err(Error::Outdated);
+            }
+        }
+
+        let _permit = self.semaphore.read(txn_id, Range::All).await?;
 
         let (version, deltas) = {
             let mut state = self.state_mut();
+            if state.finalized == Some(txn_id) {
+                return Ok((state.canon(&txn_id), None));
+            }
 
-            assert!(
-                !state.commits.contains(&txn_id),
-                "cannot roll back committed transaction {:?}",
-                txn_id
-            );
+            if state.commits.contains(&txn_id) {
+                return Err(Error::Committed);
+            }
 
             if state.finalized > Some(txn_id) {
-                panic!("tried to roll back finalized version at {:?}", txn_id);
+                return Err(Error::Outdated);
             }
 
             let mut version = state.canon(&txn_id);
@@ -667,30 +708,33 @@ where
             (version, deltas)
         };
 
-        self.semaphore.finalize(&txn_id, false);
+        self.semaphore.finalize(&txn_id, false)?;
 
-        (version, deltas)
+        Ok((version, deltas))
     }
 
     /// Finalize the state of this [`TxnSetLock`] at `txn_id`.
     /// This will merge in deltas and prevent further reads of versions earlier than `txn_id`.
-    pub fn finalize(&self, txn_id: I) {
-        self.semaphore.finalize(&txn_id, true);
-        self.state_mut().finalize(txn_id);
+    pub fn finalize(&self, txn_id: I) -> Result<()> {
+        let mut state = self.state_mut();
+        self.semaphore.finalize(&txn_id, true)?;
+        state.finalize(txn_id);
+        Ok(())
     }
 
     /// Read and finalize the state of this [`TxnSetLock`] at `txn_id`, if not already finalized.
     /// This will merge in deltas and prevent further reads of versions earlier than `txn_id`.
-    pub fn read_and_finalize(&self, txn_id: I) -> Option<Canon<T>> {
-        self.semaphore.finalize(&txn_id, true);
-        self.state_mut().finalize(txn_id).cloned()
+    pub fn read_and_finalize(&self, txn_id: I) -> Result<Option<Canon<T>>> {
+        let mut state = self.state_mut();
+        self.semaphore.finalize(&txn_id, true)?;
+        Ok(state.finalize(txn_id).cloned())
     }
 }
 
 /// An iterator over the values of a [`TxnSetLock`] as of a specific transactional version
 pub struct Iter<T> {
-    _permit: PermitRead<Range<T>>,
     iter: <Canon<T> as IntoIterator>::IntoIter,
+    _permit: PermitRead<Range<T>>,
 }
 
 impl<T> Iter<T> {
