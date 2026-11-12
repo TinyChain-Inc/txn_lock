@@ -20,8 +20,10 @@ impl<R, F> PendingRead<R, F> {
         MapFn: FnOnce(&F) -> Result<T, E>,
     {
         let mapped = map(&*self.value);
+
         let Self { value, permit } = self;
         drop(value);
+
         mapped.map(|value| PendingMap {
             value,
             _permit: permit,
@@ -51,8 +53,10 @@ impl<R, F> PendingWrite<R, F> {
         MapFn: FnOnce(&F) -> Result<T, E>,
     {
         let mapped = map(&*self.value);
+
         let Self { value, permit } = self;
         drop(value);
+
         mapped.map(|value| PendingMap {
             value,
             _permit: permit,

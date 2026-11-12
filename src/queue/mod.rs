@@ -1,6 +1,6 @@
-/// Transactional queue structures.
-use std::collections::btree_map::Entry;
-use std::collections::{BTreeMap, BTreeSet};
+//! Transactional queue structures.
+
+use std::collections::{btree_map::Entry, BTreeMap, BTreeSet};
 use std::fmt;
 use std::hash::Hash;
 

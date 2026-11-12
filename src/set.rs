@@ -7,7 +7,7 @@
 //!
 //! use futures::executor::block_on;
 //!
-//! use txn_lock::set::*;
+//! use txn_lock::set::TxnSetLock;
 //! use txn_lock::Error;
 //!
 //! let set = TxnSetLock::<u64, String>::new(0, []);
@@ -26,6 +26,7 @@
 //!     block_on(set.iter(2)).expect("iter").collect::<Vec<Arc<String>>>(),
 //!     vec![Arc::new(one.to_string())]
 //! );
+//!
 //! assert!(block_on(set.remove(2, one)).expect("remove"));
 //! assert!(!set.try_contains(2, one).expect("contains"));
 //! assert!(!set.try_remove(2, one).expect("remove"));
@@ -55,13 +56,13 @@
 
 use std::borrow::Borrow;
 use std::cmp::Ordering;
-use std::collections::hash_map::{self, HashMap};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{hash_map, BTreeMap, BTreeSet, HashMap, HashSet};
+use std::fmt;
 use std::hash::Hash;
+use std::iter;
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, RwLock as RwLockInner};
 use std::task::Poll;
-use std::{fmt, iter};
 
 use collate::Collator;
 use futures::TryFutureExt;

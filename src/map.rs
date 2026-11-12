@@ -7,7 +7,7 @@
 //!
 //! use futures::executor::block_on;
 //!
-//! use txn_lock::map::*;
+//! use txn_lock::map::TxnMapLock;
 //! use txn_lock::Error;
 //!
 //! let one = "one";
@@ -96,13 +96,13 @@
 
 use std::borrow::Borrow;
 use std::cmp::Ordering;
-use std::collections::hash_map::{self, HashMap};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{hash_map, BTreeMap, BTreeSet, HashMap, HashSet};
+use std::fmt;
 use std::hash::Hash;
+use std::iter;
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, RwLock as RwLockInner};
 use std::task::Poll;
-use std::{fmt, iter};
 
 use collate::Collator;
 use futures::TryFutureExt;
@@ -110,7 +110,7 @@ use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 
 use super::guard::{TxnReadGuard, TxnReadGuardMap, TxnWriteGuard};
 pub use super::range::{Key, Range};
-use super::semaphore::*;
+use super::semaphore::{PermitRead, PermitWrite, Semaphore};
 use super::{Error, Result};
 
 type Canon<K, V> = HashMap<Key<K>, Arc<V>>;

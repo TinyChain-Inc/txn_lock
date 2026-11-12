@@ -2,7 +2,7 @@
 //!
 //! Example:
 //! ```
-//! use txn_lock::queue::message::*;
+//! use txn_lock::queue::message::MessageQueue;
 //! use txn_lock::Error;
 //!
 //! let queue = MessageQueue::<u64, &'static str>::new(16);

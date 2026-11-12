@@ -13,7 +13,7 @@
 //!
 //! use collate::Collator;
 //!
-//! use txn_lock::semaphore::*;
+//! use txn_lock::semaphore::Semaphore;
 //! use txn_lock::Error;
 //!
 //! let collator = Collator::default();
