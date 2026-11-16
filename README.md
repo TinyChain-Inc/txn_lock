@@ -26,12 +26,17 @@ record its output before executing the corresponding operation, and call
 `complete` only after success. Dropping a task fails its transaction; no work is
 spawned or detached. Callers separately bound the number of live transactions.
 
-`record` releases preparation exclusion. Tasks in different transactions can
-execute concurrently; earlier pending outputs do not exclude later transactions.
+`start` releases lifecycle exclusion before returning a task. Preparation may
+wait on an earlier transaction while its decision proceeds. Tasks in different
+transactions can execute concurrently; earlier pending outputs do not exclude later transactions.
 Each transaction keeps its own request sequence: starting another task while its
 previous task is unfinished returns `Busy`. Admission changes its status from
 `Active` to `Running`; completion restores `Active`, and unfinished drop marks
 `Failed`. This is the authoritative queue status, not a collection lock or counter.
+The active task owns its transaction's output vector. Recording and completion
+validate that it appends exactly one output. Use `record_bounded(output, max_heap_size)`
+to admit payload bytes and vector capacity before execution; see its API
+documentation for the immutable-payload precondition and caller-owned envelope.
 
 Awaiting `operation` provides exclusive access for fallible commit, rollback, and cutoff
 finalization. Commit seals outputs and arms the permit; callers arm it explicitly

@@ -21,6 +21,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use get_size::GetSize;
 use tokio::sync::{Semaphore, SemaphorePermit};
 
 use crate::Error;
@@ -37,6 +38,9 @@ enum Status {
 struct Entry<O> {
     status: Status,
     outputs: Vec<O>,
+    // Cache intrinsic heap accounting while outputs remain immutable. Repeated
+    // bounded appends must not rescan all earlier payloads.
+    heap_size: Option<usize>,
 }
 
 struct State<I, O> {
@@ -77,6 +81,7 @@ impl<I: Ord, O> State<I, O> {
         Ok(self.entries.entry(id).or_insert_with(|| Entry {
             status: Status::Active,
             outputs: vec![],
+            heap_size: Some(0),
         }))
     }
 
@@ -170,10 +175,10 @@ impl<I: Ord, O> TaskQueue<I, O> {
         }
     }
 
-    /// Reserve one output before preparation. Recording releases preparation exclusion;
-    /// execution then overlaps other transactions. Requests within one transaction
-    /// remain ordered so execution and replay cannot disagree.
-    /// Waiting for preparation ownership registers no work. The caller bounds live
+    /// Reserve one output before preparation, releasing lifecycle exclusion before
+    /// returning. Preparation and execution overlap other transactions' decisions.
+    /// Requests within one transaction remain ordered so execution and replay
+    /// cannot disagree. Waiting for admission registers no work. The caller bounds live
     /// admissions and enforces its deadline by cancelling this future.
     pub async fn start(&self, id: I) -> Result<Task<'_, I, O>, Error>
     where
@@ -181,21 +186,27 @@ impl<I: Ord, O> TaskQueue<I, O> {
     {
         self.state()?.check_start(&id, self.capacity)?;
         let preparation = self.operation().await?;
-        {
+        let (outputs, heap_size) = {
             let mut state = self.state()?;
             // A decision or another task may have completed while admission waited.
             state.check_start(&id, self.capacity)?;
-            state.admit(id.clone())?.status = Status::Running;
-        }
+            let entry = state.admit(id.clone())?;
+            entry.status = Status::Running;
+            (std::mem::take(&mut entry.outputs), entry.heap_size.take())
+        };
+
+        preparation.complete();
 
         Ok(Task {
             queue: self,
-            preparation: Some(preparation),
+            position: outputs.len(),
+            outputs,
+            heap_size,
             id: Some(id),
         })
     }
 
-    /// Await exclusive preparation/lifecycle ownership, without excluding task execution.
+    /// Await exclusive admission/lifecycle ownership, without excluding admitted tasks.
     /// Cancelling before acquisition selects no decision and does not interrupt the owner.
     pub async fn operation(&self) -> Result<Operation<'_, I, O>, Error> {
         let permit = self
@@ -218,36 +229,97 @@ impl<I: Ord, O> TaskQueue<I, O> {
 /// Dropping without completion fails the transaction and preserves its output.
 pub struct Task<'a, I: Ord, O> {
     queue: &'a TaskQueue<I, O>,
-    preparation: Option<Operation<'a, I, O>>,
+    position: usize,
+    outputs: Vec<O>,
+    heap_size: Option<usize>,
     id: Option<I>,
 }
 
 impl<I: Ord, O> Task<'_, I, O> {
     /// Record exactly once, before executing the selected operation.
     pub fn record(&mut self, output: O) -> Result<(), Error> {
-        if self.preparation.is_none() {
+        self.check_record()?;
+        self.outputs.push(output);
+        self.heap_size = None;
+
+        Ok(())
+    }
+
+    fn check_record(&self) -> Result<(), Error> {
+        self.queue
+            .state()?
+            .check(self.id.as_ref().expect("active task"))?;
+        if self.outputs.len() != self.position {
             return Err(Error::Conflict);
         }
 
-        {
-            let mut state = self.queue.state()?;
-            let entry = state.entry(self.id.as_ref().expect("active task"))?;
-            entry.outputs.push(output);
+        Ok(())
+    }
+
+    /// Record after admitting the actual heap footprint of the complete output
+    /// vector. The caller supplies its owning resource's finite retained-byte
+    /// bound; inline container/envelope bytes belong to that owner. Accounting and
+    /// allocation run on task-owned outputs, outside shared bookkeeping locks.
+    /// Previously measured outputs must retain their reported heap footprint;
+    /// callers must not mutate retained payloads through shared aliases.
+    pub fn record_bounded(&mut self, output: O, max_heap_size: usize) -> Result<(), Error>
+    where
+        O: GetSize,
+    {
+        self.check_record()?;
+        let previous = match self.heap_size {
+            Some(size) => size,
+            None => self.outputs.iter().try_fold(0_usize, |size, output| {
+                size.checked_add(output.get_heap_size())
+                    .ok_or(Error::Saturated)
+            })?,
+        };
+        let heap = previous
+            .checked_add(output.get_heap_size())
+            .ok_or(Error::Saturated)?;
+        let available = max_heap_size.checked_sub(heap).ok_or(Error::Saturated)?;
+        let max_capacity = available
+            .checked_div(std::mem::size_of::<O>())
+            .unwrap_or(usize::MAX);
+        let required = self.outputs.len().checked_add(1).ok_or(Error::Saturated)?;
+        if required > max_capacity {
+            return Err(Error::Saturated);
         }
 
-        self.preparation.take().expect("preparation").complete();
+        if required > self.outputs.capacity() {
+            let target = self
+                .outputs
+                .capacity()
+                .saturating_mul(2)
+                .max(4)
+                .min(max_capacity)
+                .min(self.queue.capacity);
+            self.outputs
+                .try_reserve_exact(target - self.outputs.len())
+                .map_err(|_| Error::Saturated)?;
+        }
+
+        if self.outputs.capacity() > max_capacity {
+            return Err(Error::Saturated);
+        }
+
+        self.outputs.push(output);
+        self.heap_size = Some(heap);
         Ok(())
     }
 
     /// A successful task must have recorded its output.
     pub fn complete(mut self) -> Result<(), Error> {
-        if self.preparation.is_some() {
-            return Err(Error::Failed);
-        }
-
         {
             let mut state = self.queue.state()?;
-            state.entry(self.id.as_ref().expect("active task"))?.status = Status::Active;
+            let entry = state.entry(self.id.as_ref().expect("active task"))?;
+            if self.outputs.len() != self.position + 1 {
+                return Err(Error::Failed);
+            }
+
+            entry.outputs = std::mem::take(&mut self.outputs);
+            entry.heap_size = self.heap_size;
+            entry.status = Status::Active;
         }
 
         self.id.take();
@@ -260,7 +332,10 @@ impl<I: Ord, O> Drop for Task<'_, I, O> {
         if let Some(id) = &self.id {
             // Lifecycle cannot remove an entry while this task owns execution.
             if let Ok(mut state) = self.queue.shared.state.lock() {
-                state.entries.get_mut(id).expect("active task").status = Status::Failed;
+                let entry = state.entries.get_mut(id).expect("active task");
+                entry.outputs = std::mem::take(&mut self.outputs);
+                entry.heap_size = self.heap_size;
+                entry.status = Status::Failed;
             } else {
                 // Poison already prevents reuse. Drop must not panic while unwinding.
                 self.queue.shared.preparation.close();
@@ -304,6 +379,7 @@ impl<I: Ord, O> Operation<'_, I, O> {
 
         self.armed = true;
         entry.status = Status::Committed;
+        entry.heap_size = Some(0);
         Ok(Some(std::mem::take(&mut entry.outputs)))
     }
 
@@ -330,6 +406,7 @@ impl<I: Ord, O> Operation<'_, I, O> {
         let entry = state.admit(id.clone())?;
         entry.status = Status::RolledBack;
         entry.outputs = Vec::new();
+        entry.heap_size = Some(0);
         Ok(())
     }
 
@@ -402,8 +479,9 @@ mod tests {
         let queue = TaskQueue::new(2);
         for output in [10, 20] {
             let mut task = queue.start(1).await.unwrap();
-            assert!(futures::poll!(Box::pin(queue.operation())).is_pending());
-            assert!(futures::poll!(Box::pin(queue.start(2))).is_pending());
+            let operation = queue.operation().await.unwrap();
+            assert_eq!(operation.check_rollback(&1), Err(Error::Busy));
+            operation.complete();
             assert_eq!(queue.start(1).await.err(), Some(Error::Busy));
             assert_eq!(queue.readable(1), Ok(()));
             queue.register(2).unwrap();
@@ -428,6 +506,23 @@ mod tests {
         let mut task = queue.start(2).await.unwrap();
         task.record(30).unwrap();
         task.complete().unwrap();
+    }
+
+    #[tokio::test]
+    async fn preparing_later_work_allows_earlier_decisions() {
+        let queue = TaskQueue::new(2);
+        let mut earlier = queue.start(1).await.unwrap();
+        earlier.record(10).unwrap();
+        earlier.complete().unwrap();
+        let later = queue.start(2).await.unwrap();
+        let mut operation = queue.operation().await.unwrap();
+        assert_eq!(operation.commit(&1).unwrap(), Some(vec![10]));
+        assert_eq!(operation.commit(&2), Err(Error::Busy));
+        assert_eq!(operation.check_finalize(&2), Err(Error::Busy));
+        operation.finalize(1).unwrap();
+        operation.complete();
+        drop(later);
+        assert_eq!(queue.readable(2), Err(Error::Failed));
     }
 
     #[tokio::test]
@@ -496,7 +591,10 @@ mod tests {
             assert_eq!(operation.check_rollback(&1), Err(Error::Busy));
             assert_eq!(operation.check_finalize(&1), Err(Error::Busy));
             assert_eq!(operation.finalize(1), Err(Error::Busy));
-            assert_eq!(operation.pending(), vec![10, 30]);
+            assert!(
+                operation.pending().is_empty(),
+                "running tasks own their outputs"
+            );
         }
 
         first.complete().unwrap();
@@ -532,6 +630,90 @@ mod tests {
         let mut independent = queue.start(3).await.unwrap();
         independent.record(30).unwrap();
         independent.complete().unwrap();
+    }
+
+    #[tokio::test]
+    async fn bounded_records_admit_payload_and_vector_capacity_before_execution() {
+        let queue = TaskQueue::<u64, Vec<u8>>::new(8);
+        let limit = 4 * std::mem::size_of::<Vec<u8>>() + 64;
+        let mut first = queue.start(1).await.unwrap();
+        first.record_bounded(Vec::with_capacity(32), limit).unwrap();
+        first.complete().unwrap();
+        let mut second = queue.start(1).await.unwrap();
+        second
+            .record_bounded(Vec::with_capacity(32), limit)
+            .unwrap();
+        second.complete().unwrap();
+        let mut rejected = queue.start(1).await.unwrap();
+        assert_eq!(
+            rejected.record_bounded(Vec::with_capacity(1), limit),
+            Err(Error::Saturated)
+        );
+        drop(rejected);
+        let mut operation = queue.operation().await.unwrap();
+        assert_eq!(operation.commit(&1), Err(Error::Failed));
+        assert_eq!(operation.pending().len(), 2);
+        operation.rollback(&1).unwrap();
+        operation.complete();
+        let mut next = queue.start(2).await.unwrap();
+        next.record_bounded(vec![1], limit).unwrap();
+        next.complete().unwrap();
+        let mut operation = queue.operation().await.unwrap();
+        assert_eq!(operation.commit(&2).unwrap().unwrap(), vec![vec![1]]);
+        operation.complete();
+    }
+
+    #[tokio::test]
+    async fn bounded_zero_sized_outputs_still_obey_the_record_limit() {
+        let queue = TaskQueue::new(2);
+        for _ in 0..2 {
+            let mut task = queue.start(1).await.unwrap();
+            task.record_bounded((), 0).unwrap();
+            task.complete().unwrap();
+        }
+
+        assert_eq!(queue.start(1).await.err(), Some(Error::Saturated));
+        let mut operation = queue.operation().await.unwrap();
+        assert_eq!(operation.commit(&1).unwrap().unwrap().len(), 2);
+        operation.complete();
+    }
+
+    #[tokio::test]
+    async fn bounded_appends_measure_each_immutable_payload_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        struct Payload(Arc<AtomicUsize>);
+        impl get_size::GetSize for Payload {
+            fn get_heap_size(&self) -> usize {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                64
+            }
+        }
+
+        let measured = Arc::new(AtomicUsize::new(0));
+        let queue = TaskQueue::new(32);
+        for _ in 0..32 {
+            let mut task = queue.start(1).await.unwrap();
+            task.record_bounded(Payload(measured.clone()), 4096)
+                .unwrap();
+            task.complete().unwrap();
+        }
+
+        assert_eq!(measured.load(Ordering::Relaxed), 32);
+        let mut operation = queue.operation().await.unwrap();
+        assert_eq!(operation.commit(&1).unwrap().unwrap().len(), 32);
+        operation.complete();
+    }
+
+    #[tokio::test]
+    async fn bounded_accounting_can_follow_unmeasured_records() {
+        let queue = TaskQueue::new(4);
+        let mut first = queue.start(1).await.unwrap();
+        first.record(Vec::<u8>::with_capacity(128)).unwrap();
+        first.complete().unwrap();
+        let mut second = queue.start(1).await.unwrap();
+        assert_eq!(second.record_bounded(vec![1], 128), Err(Error::Saturated));
     }
 
     #[tokio::test]

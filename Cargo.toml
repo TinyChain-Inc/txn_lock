@@ -20,6 +20,7 @@ logging = ["log"]
 collate = { path = "../collate", version = "0.4" }
 hr-id = { path = "../hr-id", version = "0.7", optional = true }
 futures = "0.3"
+get-size = "0.1"
 log = { version = "0.4", features = ["release_max_level_info"], optional = true }
 tokio = { version = "1.49", features = ["sync"] }
 
